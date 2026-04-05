@@ -1,0 +1,17 @@
+build/
+*.obj
+*.o
+*.exe
+*.ilk
+*.pdb
+
+web/deadfish_wasm.js
+web/deadfish_wasm.wasm
+
+__pycache__/
+*.pyc
+
+tools/emsdk/
+.emscripten
+.emscripten_sanity
+.emscripten_cache/

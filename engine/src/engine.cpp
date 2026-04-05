@@ -1,0 +1,2044 @@
+#include "deadfish/engine.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cctype>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string_view>
+#include <unordered_map>
+
+namespace deadfish {
+
+namespace {
+
+constexpr int kNoSquare = -1;
+constexpr int kMateScore = 100000;
+constexpr int kInfinity = 200000;
+constexpr int kMaxPly = 128;
+constexpr std::uint8_t kCastleWhiteKing = 1u << 0;
+constexpr std::uint8_t kCastleWhiteQueen = 1u << 1;
+constexpr std::uint8_t kCastleBlackKing = 1u << 2;
+constexpr std::uint8_t kCastleBlackQueen = 1u << 3;
+constexpr std::string_view kCanonicalStartFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+constexpr Color opposite(Color color) {
+    return color == Color::White ? Color::Black : Color::White;
+}
+
+constexpr bool is_white(Piece piece) {
+    return piece >= Piece::WPawn && piece <= Piece::WKing;
+}
+
+constexpr bool is_black(Piece piece) {
+    return piece >= Piece::BPawn && piece <= Piece::BKing;
+}
+
+constexpr Color piece_color(Piece piece) {
+    return is_black(piece) ? Color::Black : Color::White;
+}
+
+constexpr PieceType piece_type(Piece piece) {
+    switch (piece) {
+        case Piece::WPawn:
+        case Piece::BPawn:
+            return PieceType::Pawn;
+        case Piece::WKnight:
+        case Piece::BKnight:
+            return PieceType::Knight;
+        case Piece::WBishop:
+        case Piece::BBishop:
+            return PieceType::Bishop;
+        case Piece::WRook:
+        case Piece::BRook:
+            return PieceType::Rook;
+        case Piece::WQueen:
+        case Piece::BQueen:
+            return PieceType::Queen;
+        case Piece::WKing:
+        case Piece::BKing:
+            return PieceType::King;
+        case Piece::None:
+        default:
+            return PieceType::None;
+    }
+}
+
+constexpr Piece make_piece(Color color, PieceType type) {
+    if (type == PieceType::None) {
+        return Piece::None;
+    }
+    const int offset = color == Color::White ? 0 : 6;
+    return static_cast<Piece>(static_cast<int>(type) + offset);
+}
+
+constexpr int square_file(int square) {
+    return square & 7;
+}
+
+constexpr int square_rank(int square) {
+    return square >> 3;
+}
+
+constexpr int make_square(int file, int rank) {
+    return rank * 8 + file;
+}
+
+constexpr int mirror_square(int square) {
+    return square ^ 56;
+}
+
+constexpr Bitboard bit_at(int square) {
+    return 1ULL << square;
+}
+
+char piece_to_fen(Piece piece) {
+    switch (piece) {
+        case Piece::WPawn:
+            return 'P';
+        case Piece::WKnight:
+            return 'N';
+        case Piece::WBishop:
+            return 'B';
+        case Piece::WRook:
+            return 'R';
+        case Piece::WQueen:
+            return 'Q';
+        case Piece::WKing:
+            return 'K';
+        case Piece::BPawn:
+            return 'p';
+        case Piece::BKnight:
+            return 'n';
+        case Piece::BBishop:
+            return 'b';
+        case Piece::BRook:
+            return 'r';
+        case Piece::BQueen:
+            return 'q';
+        case Piece::BKing:
+            return 'k';
+        case Piece::None:
+        default:
+            return ' ';
+    }
+}
+
+Piece fen_to_piece(char ch) {
+    switch (ch) {
+        case 'P':
+            return Piece::WPawn;
+        case 'N':
+            return Piece::WKnight;
+        case 'B':
+            return Piece::WBishop;
+        case 'R':
+            return Piece::WRook;
+        case 'Q':
+            return Piece::WQueen;
+        case 'K':
+            return Piece::WKing;
+        case 'p':
+            return Piece::BPawn;
+        case 'n':
+            return Piece::BKnight;
+        case 'b':
+            return Piece::BBishop;
+        case 'r':
+            return Piece::BRook;
+        case 'q':
+            return Piece::BQueen;
+        case 'k':
+            return Piece::BKing;
+        default:
+            return Piece::None;
+    }
+}
+
+char promotion_to_char(PieceType type) {
+    switch (type) {
+        case PieceType::Knight:
+            return 'n';
+        case PieceType::Bishop:
+            return 'b';
+        case PieceType::Rook:
+            return 'r';
+        case PieceType::Queen:
+            return 'q';
+        default:
+            return '\0';
+    }
+}
+
+std::string square_to_string(int square) {
+    if (square < 0 || square >= 64) {
+        return "-";
+    }
+    std::string out(2, ' ');
+    out[0] = static_cast<char>('a' + square_file(square));
+    out[1] = static_cast<char>('1' + square_rank(square));
+    return out;
+}
+
+int string_to_square(std::string_view text) {
+    if (text.size() != 2) {
+        return kNoSquare;
+    }
+    const char file = static_cast<char>(std::tolower(static_cast<unsigned char>(text[0])));
+    const char rank = text[1];
+    if (file < 'a' || file > 'h' || rank < '1' || rank > '8') {
+        return kNoSquare;
+    }
+    return make_square(file - 'a', rank - '1');
+}
+
+int pop_lsb(Bitboard& bb) {
+    const int square = std::countr_zero(bb);
+    bb &= bb - 1;
+    return square;
+}
+
+constexpr std::array<int, 7> kPieceValues = {0, 100, 320, 330, 500, 900, 0};
+constexpr std::array<int, 7> kPieceValuesEndgame = {0, 110, 310, 340, 510, 900, 0};
+constexpr std::array<int, 7> kPiecePhaseWeights = {0, 0, 1, 1, 2, 4, 0};
+constexpr std::array<int, 8> kPassedPawnBonus = {0, 10, 16, 28, 44, 66, 92, 0};
+
+constexpr std::array<int, 64> kPawnTable = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    5, 10, 10, -20, -20, 10, 10, 5,
+    5, -5, -10, 0, 0, -10, -5, 5,
+    0, 0, 0, 20, 20, 0, 0, 0,
+    5, 5, 10, 25, 25, 10, 5, 5,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+constexpr std::array<int, 64> kKnightTable = {
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20, 0, 5, 5, 0, -20, -40,
+    -30, 5, 10, 15, 15, 10, 5, -30,
+    -30, 0, 15, 20, 20, 15, 0, -30,
+    -30, 5, 15, 20, 20, 15, 5, -30,
+    -30, 0, 10, 15, 15, 10, 0, -30,
+    -40, -20, 0, 0, 0, 0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50,
+};
+
+constexpr std::array<int, 64> kBishopTable = {
+    -20, -10, -10, -10, -10, -10, -10, -20,
+    -10, 5, 0, 0, 0, 0, 5, -10,
+    -10, 10, 10, 10, 10, 10, 10, -10,
+    -10, 0, 10, 10, 10, 10, 0, -10,
+    -10, 5, 5, 10, 10, 5, 5, -10,
+    -10, 0, 5, 10, 10, 5, 0, -10,
+    -10, 0, 0, 0, 0, 0, 0, -10,
+    -20, -10, -10, -10, -10, -10, -10, -20,
+};
+
+constexpr std::array<int, 64> kRookTable = {
+    0, 0, 0, 5, 5, 0, 0, 0,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    5, 10, 10, 10, 10, 10, 10, 5,
+    0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+constexpr std::array<int, 64> kQueenTable = {
+    -20, -10, -10, -5, -5, -10, -10, -20,
+    -10, 0, 5, 0, 0, 0, 0, -10,
+    -10, 5, 5, 5, 5, 5, 0, -10,
+    0, 0, 5, 5, 5, 5, 0, -5,
+    -5, 0, 5, 5, 5, 5, 0, -5,
+    -10, 0, 5, 5, 5, 5, 0, -10,
+    -10, 0, 0, 0, 0, 0, 0, -10,
+    -20, -10, -10, -5, -5, -10, -10, -20,
+};
+
+constexpr std::array<int, 64> kKingMiddleTable = {
+    20, 30, 10, 0, 0, 10, 30, 20,
+    20, 20, 0, 0, 0, 0, 20, 20,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+    -20, -30, -30, -40, -40, -30, -30, -20,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+};
+
+constexpr std::array<int, 64> kKingEndTable = {
+    -20, -10, -4, 0, 0, -4, -10, -20,
+    -10, 0, 8, 12, 12, 8, 0, -10,
+    -4, 8, 18, 22, 22, 18, 8, -4,
+    0, 12, 22, 28, 28, 22, 12, 0,
+    0, 12, 22, 28, 28, 22, 12, 0,
+    -4, 8, 18, 22, 22, 18, 8, -4,
+    -10, 0, 8, 12, 12, 8, 0, -10,
+    -20, -10, -4, 0, 0, -4, -10, -20,
+};
+
+std::array<Bitboard, 64> make_knight_attacks() {
+    std::array<Bitboard, 64> table{};
+    constexpr std::array<std::pair<int, int>, 8> jumps = {{
+        {-2, -1}, {-2, 1}, {-1, -2}, {-1, 2},
+        {1, -2}, {1, 2}, {2, -1}, {2, 1},
+    }};
+    for (int square = 0; square < 64; ++square) {
+        Bitboard attacks = 0;
+        const int file = square_file(square);
+        const int rank = square_rank(square);
+        for (const auto& [df, dr] : jumps) {
+            const int next_file = file + df;
+            const int next_rank = rank + dr;
+            if (next_file >= 0 && next_file < 8 && next_rank >= 0 && next_rank < 8) {
+                attacks |= bit_at(make_square(next_file, next_rank));
+            }
+        }
+        table[square] = attacks;
+    }
+    return table;
+}
+
+std::array<Bitboard, 64> make_king_attacks() {
+    std::array<Bitboard, 64> table{};
+    for (int square = 0; square < 64; ++square) {
+        Bitboard attacks = 0;
+        const int file = square_file(square);
+        const int rank = square_rank(square);
+        for (int df = -1; df <= 1; ++df) {
+            for (int dr = -1; dr <= 1; ++dr) {
+                if (df == 0 && dr == 0) {
+                    continue;
+                }
+                const int next_file = file + df;
+                const int next_rank = rank + dr;
+                if (next_file >= 0 && next_file < 8 && next_rank >= 0 && next_rank < 8) {
+                    attacks |= bit_at(make_square(next_file, next_rank));
+                }
+            }
+        }
+        table[square] = attacks;
+    }
+    return table;
+}
+
+std::array<std::array<Bitboard, 64>, 2> make_pawn_attacks() {
+    std::array<std::array<Bitboard, 64>, 2> table{};
+    for (int square = 0; square < 64; ++square) {
+        Bitboard white_attacks = 0;
+        Bitboard black_attacks = 0;
+        const int file = square_file(square);
+        const int rank = square_rank(square);
+        if (rank < 7) {
+            if (file > 0) {
+                white_attacks |= bit_at(make_square(file - 1, rank + 1));
+            }
+            if (file < 7) {
+                white_attacks |= bit_at(make_square(file + 1, rank + 1));
+            }
+        }
+        if (rank > 0) {
+            if (file > 0) {
+                black_attacks |= bit_at(make_square(file - 1, rank - 1));
+            }
+            if (file < 7) {
+                black_attacks |= bit_at(make_square(file + 1, rank - 1));
+            }
+        }
+        table[static_cast<std::size_t>(Color::White)][square] = white_attacks;
+        table[static_cast<std::size_t>(Color::Black)][square] = black_attacks;
+    }
+    return table;
+}
+
+const auto kKnightAttacks = make_knight_attacks();
+const auto kKingAttacks = make_king_attacks();
+const auto kPawnAttacks = make_pawn_attacks();
+
+struct ZobristTables {
+    std::array<std::array<std::uint64_t, 64>, 13> pieces{};
+    std::array<std::uint64_t, 16> castling{};
+    std::array<std::uint64_t, 8> en_passant{};
+    std::uint64_t side = 0;
+};
+
+ZobristTables make_zobrist_tables() {
+    ZobristTables tables{};
+    std::mt19937_64 rng(0xD34DF15ULL ^ 0x20260405ULL);
+    for (auto& piece_row : tables.pieces) {
+        for (auto& cell : piece_row) {
+            cell = rng();
+        }
+    }
+    for (auto& entry : tables.castling) {
+        entry = rng();
+    }
+    for (auto& entry : tables.en_passant) {
+        entry = rng();
+    }
+    tables.side = rng();
+    return tables;
+}
+
+const ZobristTables kZobrist = make_zobrist_tables();
+
+bool is_center_square(int square) {
+    const int file = square_file(square);
+    const int rank = square_rank(square);
+    return (file == 3 || file == 4) && (rank == 3 || rank == 4);
+}
+
+bool is_extended_center_square(int square) {
+    const int file = square_file(square);
+    const int rank = square_rank(square);
+    return file >= 2 && file <= 5 && rank >= 2 && rank <= 5;
+}
+
+int square_table_value(const std::array<int, 64>& table, int square, Color color) {
+    return color == Color::White ? table[square] : table[mirror_square(square)];
+}
+
+int phase_value(const Position& position) {
+    int phase = 0;
+    for (const Piece piece : position.board()) {
+        phase += kPiecePhaseWeights[static_cast<std::size_t>(piece_type(piece))];
+    }
+    return std::min(24, phase);
+}
+
+}  // namespace
+
+}  // namespace deadfish
+
+namespace deadfish {
+
+namespace {
+
+struct SearchNodeResult {
+    int score = 0;
+    Move best_move = Move::null();
+    std::vector<Move> pv;
+    bool completed = true;
+};
+
+SearchNodeResult node_result(int score = 0, bool completed = true, Move best_move = Move::null(), std::vector<Move> pv = {}) {
+    SearchNodeResult result;
+    result.score = score;
+    result.best_move = best_move;
+    result.pv = std::move(pv);
+    result.completed = completed;
+    return result;
+}
+
+enum class TTFlag : std::uint8_t {
+    Exact = 0,
+    Lower,
+    Upper,
+};
+
+struct TTEntry {
+    int depth = 0;
+    int score = 0;
+    TTFlag flag = TTFlag::Exact;
+    Move best_move = Move::null();
+};
+
+struct SearchContext {
+    SearchLimits limits{};
+    SearchCallback callback{};
+    std::chrono::steady_clock::time_point start_time{};
+    std::uint64_t nodes = 0;
+    bool stop = false;
+    std::unordered_map<std::uint64_t, TTEntry> tt{};
+    std::array<std::array<Move, 2>, kMaxPly> killers{};
+    std::array<std::array<std::array<int, 64>, 64>, 2> history{};
+};
+
+bool should_stop(SearchContext& context) {
+    if (context.stop || context.limits.time_limit_ms <= 0) {
+        return context.stop;
+    }
+    if ((context.nodes & 2047ULL) != 0) {
+        return false;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - context.start_time).count();
+    if (elapsed >= context.limits.time_limit_ms) {
+        context.stop = true;
+    }
+    return context.stop;
+}
+
+Piece captured_piece_for_move(const Position& position, const Move& move) {
+    if (move.flag == MoveFlag::EnPassant) {
+        return make_piece(opposite(position.side_to_move()), PieceType::Pawn);
+    }
+    return position.piece_at(move.to);
+}
+
+int move_history_bonus(int depth) {
+    return depth * depth + 4 * depth;
+}
+
+int move_order_score(const Position& position, const Move& move, const Move& tt_move,
+                     const std::array<std::array<Move, 2>, kMaxPly>& killers,
+                     const std::array<std::array<std::array<int, 64>, 64>, 2>& history,
+                     int ply) {
+    if (move == tt_move) {
+        return 1'000'000;
+    }
+
+    int score = 0;
+    const Piece mover = position.piece_at(move.from);
+    const Piece victim = captured_piece_for_move(position, move);
+    if (victim != Piece::None) {
+        score += 100'000;
+        score += kPieceValues[static_cast<std::size_t>(piece_type(victim))] * 16;
+        score -= kPieceValues[static_cast<std::size_t>(piece_type(mover))];
+    }
+    if (move.is_promotion()) {
+        score += 95'000 + kPieceValues[static_cast<std::size_t>(move.promotion)];
+    }
+    if (ply < kMaxPly) {
+        if (move == killers[ply][0]) {
+            score += 80'000;
+        } else if (move == killers[ply][1]) {
+            score += 79'000;
+        }
+    }
+    score += history[static_cast<std::size_t>(position.side_to_move())][move.from][move.to];
+    if (move.flag == MoveFlag::KingCastle || move.flag == MoveFlag::QueenCastle) {
+        score += 150;
+    }
+    return score;
+}
+
+void order_moves(const Position& position, std::vector<Move>& moves, const Move& tt_move,
+                 const std::array<std::array<Move, 2>, kMaxPly>& killers,
+                 const std::array<std::array<std::array<int, 64>, 64>, 2>& history,
+                 int ply) {
+    std::stable_sort(moves.begin(), moves.end(), [&](const Move& lhs, const Move& rhs) {
+        return move_order_score(position, lhs, tt_move, killers, history, ply) >
+               move_order_score(position, rhs, tt_move, killers, history, ply);
+    });
+}
+
+SearchNodeResult quiescence(Position& position, SearchContext& context, int alpha, int beta, int ply) {
+    if (should_stop(context)) {
+        return node_result(0, false);
+    }
+    context.nodes += 1;
+
+    if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
+        return node_result(0, true);
+    }
+
+    int stand_pat = position.evaluate_relative();
+    if (stand_pat >= beta) {
+        return node_result(beta, true);
+    }
+    if (stand_pat > alpha) {
+        alpha = stand_pat;
+    }
+
+    std::vector<Move> moves = position.in_check(position.side_to_move())
+        ? position.legal_moves_fast(false)
+        : position.legal_moves_fast(true);
+    if (moves.empty()) {
+        if (position.in_check(position.side_to_move())) {
+            return node_result(-kMateScore + ply, true);
+        }
+        return node_result(alpha, true);
+    }
+
+    order_moves(position, moves, Move::null(), context.killers, context.history, ply);
+
+    SearchNodeResult best = node_result(alpha, true);
+    for (const Move& move : moves) {
+        UndoState undo;
+        if (!position.make_move(move, undo)) {
+            continue;
+        }
+        SearchNodeResult child = quiescence(position, context, -beta, -alpha, ply + 1);
+        position.unmake_move(undo);
+        if (!child.completed) {
+            return node_result(0, false);
+        }
+
+        const int score = -child.score;
+        if (score >= beta) {
+            return node_result(beta, true, move, {move});
+        }
+        if (score > alpha) {
+            alpha = score;
+            best.score = score;
+            best.best_move = move;
+            best.pv = child.pv;
+            best.pv.insert(best.pv.begin(), move);
+        }
+    }
+    if (best.pv.empty()) {
+        best.score = alpha;
+    }
+    return best;
+}
+
+SearchNodeResult negamax(Position& position, SearchContext& context, int depth, int alpha, int beta, int ply) {
+    if (should_stop(context)) {
+        return node_result(0, false);
+    }
+
+    const int alpha_original = alpha;
+    const std::uint64_t hash = position.hash();
+    Move tt_move = Move::null();
+
+    auto tt_it = context.tt.find(hash);
+    if (tt_it != context.tt.end() && tt_it->second.depth >= depth) {
+        tt_move = tt_it->second.best_move;
+        if (tt_it->second.flag == TTFlag::Exact) {
+            return {.score = tt_it->second.score, .best_move = tt_it->second.best_move, .pv = {tt_it->second.best_move}, .completed = true};
+        }
+        if (tt_it->second.flag == TTFlag::Lower) {
+            alpha = std::max(alpha, tt_it->second.score);
+        } else if (tt_it->second.flag == TTFlag::Upper) {
+            beta = std::min(beta, tt_it->second.score);
+        }
+        if (alpha >= beta) {
+            return {.score = tt_it->second.score, .best_move = tt_it->second.best_move, .pv = {tt_it->second.best_move}, .completed = true};
+        }
+    }
+
+    if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
+        return node_result(0, true);
+    }
+    if (depth <= 0) {
+        return quiescence(position, context, alpha, beta, ply);
+    }
+
+    context.nodes += 1;
+    std::vector<Move> moves = position.legal_moves_fast(false);
+    if (moves.empty()) {
+        if (position.in_check(position.side_to_move())) {
+            return node_result(-kMateScore + ply, true);
+        }
+        return node_result(0, true);
+    }
+
+    order_moves(position, moves, tt_move, context.killers, context.history, ply);
+
+    SearchNodeResult best = node_result(-kInfinity, true);
+    for (const Move& move : moves) {
+        UndoState undo;
+        if (!position.make_move(move, undo)) {
+            continue;
+        }
+        SearchNodeResult child = negamax(position, context, depth - 1, -beta, -alpha, ply + 1);
+        position.unmake_move(undo);
+        if (!child.completed) {
+            return node_result(0, false);
+        }
+
+        const int score = -child.score;
+        if (score > best.score) {
+            best.score = score;
+            best.best_move = move;
+            best.pv = child.pv;
+            best.pv.insert(best.pv.begin(), move);
+        }
+
+        alpha = std::max(alpha, score);
+        if (alpha >= beta) {
+            if (!move.is_capture() && ply < kMaxPly) {
+                if (context.killers[ply][0] != move) {
+                    context.killers[ply][1] = context.killers[ply][0];
+                    context.killers[ply][0] = move;
+                }
+                context.history[static_cast<std::size_t>(position.side_to_move())][move.from][move.to] += move_history_bonus(depth);
+            }
+            break;
+        }
+    }
+
+    if (!context.stop && !best.best_move.is_null()) {
+        TTEntry entry;
+        entry.depth = depth;
+        entry.score = best.score;
+        entry.best_move = best.best_move;
+        if (best.score <= alpha_original) {
+            entry.flag = TTFlag::Upper;
+        } else if (best.score >= beta) {
+            entry.flag = TTFlag::Lower;
+        } else {
+            entry.flag = TTFlag::Exact;
+        }
+        if (context.tt.size() > 250000) {
+            context.tt.clear();
+        }
+        context.tt[hash] = entry;
+    }
+
+    return best;
+}
+
+std::uint64_t perft_recursive(Position& position, int depth) {
+    if (depth <= 0) {
+        return 1;
+    }
+    std::vector<Move> moves = position.legal_moves_fast(false);
+    if (depth == 1) {
+        return moves.size();
+    }
+    std::uint64_t nodes = 0;
+    for (const Move& move : moves) {
+        UndoState undo;
+        position.make_move(move, undo);
+        nodes += perft_recursive(position, depth - 1);
+        position.unmake_move(undo);
+    }
+    return nodes;
+}
+
+}  // namespace
+
+Engine::Engine() = default;
+
+SearchResult Engine::search(const Position& root, const SearchLimits& limits, SearchCallback callback) {
+    SearchContext context;
+    context.limits = limits;
+    context.callback = std::move(callback);
+    context.start_time = std::chrono::steady_clock::now();
+    context.tt.reserve(131072);
+
+    Position position = root;
+    SearchResult result;
+    result.best_move = Move::null();
+
+    const int max_depth = std::max(1, limits.max_depth);
+    for (int depth = 1; depth <= max_depth; ++depth) {
+        SearchNodeResult node = negamax(position, context, depth, -kInfinity, kInfinity, 0);
+        if (!node.completed) {
+            result.timed_out = context.stop;
+            break;
+        }
+        if (!node.best_move.is_null()) {
+            result.best_move = node.best_move;
+            result.score = node.score;
+            result.depth_reached = depth;
+            result.pv = node.pv;
+            result.completed = true;
+        }
+
+        const int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - context.start_time).count());
+        const std::uint64_t nps = elapsed > 0 ? (context.nodes * 1000ULL) / static_cast<std::uint64_t>(elapsed) : context.nodes;
+        if (context.callback) {
+            context.callback(SearchInfo{
+                .depth = depth,
+                .score = result.score,
+                .nodes = context.nodes,
+                .nps = nps,
+                .elapsed_ms = elapsed,
+                .pv = result.pv,
+            });
+        }
+        if (std::abs(result.score) >= kMateScore - 128) {
+            break;
+        }
+        if (context.stop) {
+            result.timed_out = true;
+            break;
+        }
+    }
+
+    result.elapsed_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - context.start_time).count());
+    result.nodes = context.nodes;
+    result.nps = result.elapsed_ms > 0 ? (context.nodes * 1000ULL) / static_cast<std::uint64_t>(result.elapsed_ms) : context.nodes;
+    return result;
+}
+
+std::uint64_t Engine::perft(const Position& root, int depth) {
+    Position position = root;
+    return perft_recursive(position, depth);
+}
+
+std::vector<std::pair<Move, std::uint64_t>> Engine::divide(const Position& root, int depth) {
+    Position position = root;
+    std::vector<std::pair<Move, std::uint64_t>> result;
+    for (const Move& move : position.legal_moves_fast(false)) {
+        UndoState undo;
+        position.make_move(move, undo);
+        result.push_back({move, perft_recursive(position, depth - 1)});
+        position.unmake_move(undo);
+    }
+    return result;
+}
+
+std::vector<std::string> Engine::benchmark_positions() {
+    return {
+        std::string(kCanonicalStartFen),
+        "r3k2r/p1ppqpb1/bn2pnp1/2pP4/1p2P3/2N2N2/PPQ1BPPP/R1B1K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "6k1/5ppp/8/8/8/8/5PPP/6KQ w - - 0 1",
+    };
+}
+
+std::string score_to_string(int score) {
+    if (std::abs(score) >= kMateScore - 256) {
+        const int mate_in = std::max(1, (kMateScore - std::abs(score) + 1) / 2);
+        return score > 0 ? "M" + std::to_string(mate_in) : "-M" + std::to_string(mate_in);
+    }
+    std::ostringstream out;
+    out.setf(std::ios::fixed);
+    out.precision(2);
+    out << static_cast<double>(score) / 100.0;
+    return out.str();
+}
+
+std::string join_moves(const std::vector<Move>& moves, const std::string& delimiter) {
+    std::ostringstream out;
+    bool first = true;
+    for (const Move& move : moves) {
+        if (!first) {
+            out << delimiter;
+        }
+        first = false;
+        out << move.to_uci();
+    }
+    return out.str();
+}
+
+}  // namespace deadfish
+
+namespace deadfish {
+
+Move Move::null() {
+    return Move{};
+}
+
+bool Move::is_null() const {
+    return from == 0 && to == 0 && flag == MoveFlag::Quiet && promotion == PieceType::None;
+}
+
+bool Move::is_capture() const {
+    return flag == MoveFlag::Capture || flag == MoveFlag::PromotionCapture || flag == MoveFlag::EnPassant;
+}
+
+bool Move::is_promotion() const {
+    return flag == MoveFlag::Promotion || flag == MoveFlag::PromotionCapture;
+}
+
+std::string Move::to_uci() const {
+    std::string text = square_to_string(from) + square_to_string(to);
+    if (promotion != PieceType::None) {
+        text += promotion_to_char(promotion);
+    }
+    return text;
+}
+
+bool operator==(const Move& lhs, const Move& rhs) {
+    return lhs.from == rhs.from && lhs.to == rhs.to &&
+           lhs.flag == rhs.flag && lhs.promotion == rhs.promotion;
+}
+
+bool operator!=(const Move& lhs, const Move& rhs) {
+    return !(lhs == rhs);
+}
+
+Position::Position() {
+    *this = Position::start_position();
+}
+
+Position::Position(RawInitTag) {
+    clear();
+}
+
+Position Position::start_position() {
+    return Position::from_fen(std::string(kCanonicalStartFen));
+}
+
+Position Position::from_fen(const std::string& fen, std::string* error) {
+    Position position(RawInitTag{});
+
+    std::istringstream stream(fen);
+    std::string board_part;
+    std::string side_part;
+    std::string castling_part;
+    std::string ep_part;
+    std::string halfmove_part;
+    std::string fullmove_part;
+    if (!(stream >> board_part >> side_part >> castling_part >> ep_part >> halfmove_part >> fullmove_part)) {
+        if (error) {
+            *error = "FEN must contain six fields.";
+        }
+        return Position::start_position();
+    }
+
+    int rank = 7;
+    int file = 0;
+    for (char ch : board_part) {
+        if (ch == '/') {
+            if (file != 8) {
+                if (error) {
+                    *error = "Invalid board rows in FEN.";
+                }
+                return Position::start_position();
+            }
+            rank -= 1;
+            file = 0;
+            continue;
+        }
+        if (std::isdigit(static_cast<unsigned char>(ch))) {
+            file += ch - '0';
+            continue;
+        }
+        if (rank < 0 || file >= 8) {
+            if (error) {
+                *error = "FEN board overflowed the board.";
+            }
+            return Position::start_position();
+        }
+        const Piece piece = fen_to_piece(ch);
+        if (piece == Piece::None) {
+            if (error) {
+                *error = "Unknown FEN piece.";
+            }
+            return Position::start_position();
+        }
+        position.place_piece(make_square(file, rank), piece);
+        file += 1;
+    }
+    if (rank != 0 || file != 8) {
+        if (error) {
+            *error = "FEN board did not finish on h1.";
+        }
+        return Position::start_position();
+    }
+
+    if (side_part == "w") {
+        position.side_to_move_ = Color::White;
+    } else if (side_part == "b") {
+        position.side_to_move_ = Color::Black;
+    } else {
+        if (error) {
+            *error = "Invalid side-to-move field.";
+        }
+        return Position::start_position();
+    }
+
+    position.castling_rights_ = 0;
+    if (castling_part != "-") {
+        for (char ch : castling_part) {
+            switch (ch) {
+                case 'K':
+                    position.castling_rights_ |= kCastleWhiteKing;
+                    break;
+                case 'Q':
+                    position.castling_rights_ |= kCastleWhiteQueen;
+                    break;
+                case 'k':
+                    position.castling_rights_ |= kCastleBlackKing;
+                    break;
+                case 'q':
+                    position.castling_rights_ |= kCastleBlackQueen;
+                    break;
+                default:
+                    if (error) {
+                        *error = "Invalid castling-rights field.";
+                    }
+                    return Position::start_position();
+            }
+        }
+    }
+
+    position.en_passant_square_ = ep_part == "-" ? kNoSquare : string_to_square(ep_part);
+    if (ep_part != "-" && position.en_passant_square_ == kNoSquare) {
+        if (error) {
+            *error = "Invalid en-passant square.";
+        }
+        return Position::start_position();
+    }
+
+    try {
+        position.halfmove_clock_ = std::stoi(halfmove_part);
+        position.fullmove_number_ = std::stoi(fullmove_part);
+    } catch (const std::exception&) {
+        if (error) {
+            *error = "Halfmove/fullmove fields must be integers.";
+        }
+        return Position::start_position();
+    }
+
+    if (std::popcount(position.piece_bitboards_[static_cast<std::size_t>(Piece::WKing)]) != 1 ||
+        std::popcount(position.piece_bitboards_[static_cast<std::size_t>(Piece::BKing)]) != 1) {
+        if (error) {
+            *error = "FEN must contain exactly one king for each side.";
+        }
+        return Position::start_position();
+    }
+
+    position.hash_ = position.compute_hash();
+    position.repetition_history_.push_back(position.hash_);
+    if (error) {
+        *error = "";
+    }
+    return position;
+}
+
+std::string Position::to_fen() const {
+    std::ostringstream out;
+    for (int rank = 7; rank >= 0; --rank) {
+        int empty_count = 0;
+        for (int file = 0; file < 8; ++file) {
+            const Piece piece = board_[make_square(file, rank)];
+            if (piece == Piece::None) {
+                empty_count += 1;
+                continue;
+            }
+            if (empty_count > 0) {
+                out << empty_count;
+                empty_count = 0;
+            }
+            out << piece_to_fen(piece);
+        }
+        if (empty_count > 0) {
+            out << empty_count;
+        }
+        if (rank > 0) {
+            out << '/';
+        }
+    }
+    out << ' ' << (side_to_move_ == Color::White ? 'w' : 'b') << ' ';
+    if (castling_rights_ == 0) {
+        out << '-';
+    } else {
+        if ((castling_rights_ & kCastleWhiteKing) != 0) {
+            out << 'K';
+        }
+        if ((castling_rights_ & kCastleWhiteQueen) != 0) {
+            out << 'Q';
+        }
+        if ((castling_rights_ & kCastleBlackKing) != 0) {
+            out << 'k';
+        }
+        if ((castling_rights_ & kCastleBlackQueen) != 0) {
+            out << 'q';
+        }
+    }
+    out << ' ';
+    out << (en_passant_square_ == kNoSquare ? "-" : square_to_string(en_passant_square_));
+    out << ' ' << halfmove_clock_ << ' ' << fullmove_number_;
+    return out.str();
+}
+
+std::string Position::pretty() const {
+    std::ostringstream out;
+    out << "\n  +-----------------+\n";
+    for (int rank = 7; rank >= 0; --rank) {
+        out << (rank + 1) << " | ";
+        for (int file = 0; file < 8; ++file) {
+            const Piece piece = board_[make_square(file, rank)];
+            out << (piece == Piece::None ? '.' : piece_to_fen(piece)) << ' ';
+        }
+        out << "|\n";
+    }
+    out << "  +-----------------+\n";
+    out << "    a b c d e f g h\n";
+    out << "Turn: " << (side_to_move_ == Color::White ? "White" : "Black") << "\n";
+    out << "FEN:  " << to_fen() << "\n";
+    return out.str();
+}
+
+Color Position::side_to_move() const {
+    return side_to_move_;
+}
+
+std::uint8_t Position::castling_rights() const {
+    return castling_rights_;
+}
+
+int Position::en_passant_square() const {
+    return en_passant_square_;
+}
+
+int Position::halfmove_clock() const {
+    return halfmove_clock_;
+}
+
+int Position::fullmove_number() const {
+    return fullmove_number_;
+}
+
+std::uint64_t Position::hash() const {
+    return hash_;
+}
+
+const std::array<Piece, 64>& Position::board() const {
+    return board_;
+}
+
+Piece Position::piece_at(int square) const {
+    return square >= 0 && square < 64 ? board_[square] : Piece::None;
+}
+
+void Position::clear() {
+    board_.fill(Piece::None);
+    piece_bitboards_.fill(0);
+    color_bitboards_.fill(0);
+    side_to_move_ = Color::White;
+    castling_rights_ = 0;
+    en_passant_square_ = kNoSquare;
+    halfmove_clock_ = 0;
+    fullmove_number_ = 1;
+    hash_ = 0;
+    repetition_history_.clear();
+}
+
+void Position::place_piece(int square, Piece piece) {
+    if (square < 0 || square >= 64 || piece == Piece::None) {
+        return;
+    }
+    board_[square] = piece;
+    piece_bitboards_[static_cast<std::size_t>(piece)] |= bit_at(square);
+    color_bitboards_[static_cast<std::size_t>(piece_color(piece))] |= bit_at(square);
+}
+
+void Position::remove_piece(int square) {
+    if (square < 0 || square >= 64) {
+        return;
+    }
+    const Piece piece = board_[square];
+    if (piece == Piece::None) {
+        return;
+    }
+    piece_bitboards_[static_cast<std::size_t>(piece)] &= ~bit_at(square);
+    color_bitboards_[static_cast<std::size_t>(piece_color(piece))] &= ~bit_at(square);
+    board_[square] = Piece::None;
+}
+
+void Position::move_piece(int from, int to) {
+    const Piece piece = board_[from];
+    remove_piece(from);
+    remove_piece(to);
+    place_piece(to, piece);
+}
+
+void Position::refresh_color_bitboards() {
+    color_bitboards_.fill(0);
+    for (std::size_t piece = static_cast<std::size_t>(Piece::WPawn); piece <= static_cast<std::size_t>(Piece::WKing); ++piece) {
+        color_bitboards_[static_cast<std::size_t>(Color::White)] |= piece_bitboards_[piece];
+    }
+    for (std::size_t piece = static_cast<std::size_t>(Piece::BPawn); piece <= static_cast<std::size_t>(Piece::BKing); ++piece) {
+        color_bitboards_[static_cast<std::size_t>(Color::Black)] |= piece_bitboards_[piece];
+    }
+}
+
+std::uint64_t Position::compute_hash() const {
+    std::uint64_t value = 0;
+    for (int square = 0; square < 64; ++square) {
+        const Piece piece = board_[square];
+        if (piece != Piece::None) {
+            value ^= kZobrist.pieces[static_cast<std::size_t>(piece)][square];
+        }
+    }
+    value ^= kZobrist.castling[castling_rights_ & 0x0F];
+    if (en_passant_square_ != kNoSquare) {
+        value ^= kZobrist.en_passant[square_file(en_passant_square_)];
+    }
+    if (side_to_move_ == Color::Black) {
+        value ^= kZobrist.side;
+    }
+    return value;
+}
+
+int Position::king_square(Color color) const {
+    const Piece king = color == Color::White ? Piece::WKing : Piece::BKing;
+    const Bitboard bb = piece_bitboards_[static_cast<std::size_t>(king)];
+    return bb == 0 ? kNoSquare : std::countr_zero(bb);
+}
+
+bool Position::is_square_attacked(int square, Color by_color) const {
+    if (square < 0 || square >= 64) {
+        return false;
+    }
+    const int file = square_file(square);
+    if (by_color == Color::White) {
+        if (file > 0 && square >= 9 && board_[square - 9] == Piece::WPawn) {
+            return true;
+        }
+        if (file < 7 && square >= 7 && board_[square - 7] == Piece::WPawn) {
+            return true;
+        }
+    } else {
+        if (file > 0 && square <= 55 && board_[square + 7] == Piece::BPawn) {
+            return true;
+        }
+        if (file < 7 && square <= 54 && board_[square + 9] == Piece::BPawn) {
+            return true;
+        }
+    }
+
+    const Piece knight = by_color == Color::White ? Piece::WKnight : Piece::BKnight;
+    if ((kKnightAttacks[square] & piece_bitboards_[static_cast<std::size_t>(knight)]) != 0) {
+        return true;
+    }
+    const Piece king = by_color == Color::White ? Piece::WKing : Piece::BKing;
+    if ((kKingAttacks[square] & piece_bitboards_[static_cast<std::size_t>(king)]) != 0) {
+        return true;
+    }
+
+    auto attacks_on_ray = [&](int df, int dr, PieceType ray_a, PieceType ray_b) {
+        int next_file = file + df;
+        int next_rank = square_rank(square) + dr;
+        while (next_file >= 0 && next_file < 8 && next_rank >= 0 && next_rank < 8) {
+            const int target = make_square(next_file, next_rank);
+            const Piece piece = board_[target];
+            if (piece != Piece::None) {
+                if (piece_color(piece) == by_color) {
+                    const PieceType type = piece_type(piece);
+                    return type == ray_a || type == ray_b;
+                }
+                return false;
+            }
+            next_file += df;
+            next_rank += dr;
+        }
+        return false;
+    };
+
+    return attacks_on_ray(1, 0, PieceType::Rook, PieceType::Queen) ||
+           attacks_on_ray(-1, 0, PieceType::Rook, PieceType::Queen) ||
+           attacks_on_ray(0, 1, PieceType::Rook, PieceType::Queen) ||
+           attacks_on_ray(0, -1, PieceType::Rook, PieceType::Queen) ||
+           attacks_on_ray(1, 1, PieceType::Bishop, PieceType::Queen) ||
+           attacks_on_ray(1, -1, PieceType::Bishop, PieceType::Queen) ||
+           attacks_on_ray(-1, 1, PieceType::Bishop, PieceType::Queen) ||
+           attacks_on_ray(-1, -1, PieceType::Bishop, PieceType::Queen);
+}
+
+bool Position::in_check(Color color) const {
+    const int square = king_square(color);
+    return square != kNoSquare && is_square_attacked(square, opposite(color));
+}
+
+std::vector<Move> Position::generate_pseudo_moves(bool captures_only) const {
+    std::vector<Move> moves;
+    const Color us = side_to_move_;
+    const Color them = opposite(us);
+    auto push_move = [&](int from, int to, MoveFlag flag, PieceType promotion = PieceType::None) {
+        moves.push_back(Move{
+            .from = static_cast<std::uint8_t>(from),
+            .to = static_cast<std::uint8_t>(to),
+            .flag = flag,
+            .promotion = promotion,
+        });
+    };
+    auto add_promotions = [&](int from, int to, bool capture) {
+        push_move(from, to, capture ? MoveFlag::PromotionCapture : MoveFlag::Promotion, PieceType::Queen);
+        push_move(from, to, capture ? MoveFlag::PromotionCapture : MoveFlag::Promotion, PieceType::Rook);
+        push_move(from, to, capture ? MoveFlag::PromotionCapture : MoveFlag::Promotion, PieceType::Bishop);
+        push_move(from, to, capture ? MoveFlag::PromotionCapture : MoveFlag::Promotion, PieceType::Knight);
+    };
+
+    for (int from = 0; from < 64; ++from) {
+        const Piece piece = board_[from];
+        if (piece == Piece::None || piece_color(piece) != us) {
+            continue;
+        }
+        const PieceType type = piece_type(piece);
+        const int file = square_file(from);
+        const int rank = square_rank(from);
+
+        if (type == PieceType::Pawn) {
+            const int direction = us == Color::White ? 8 : -8;
+            const int start_rank = us == Color::White ? 1 : 6;
+            const int promotion_rank = us == Color::White ? 6 : 1;
+            const int next = from + direction;
+            if (!captures_only && next >= 0 && next < 64 && board_[next] == Piece::None) {
+                if (rank == promotion_rank) {
+                    add_promotions(from, next, false);
+                } else {
+                    push_move(from, next, MoveFlag::Quiet);
+                    const int jump = from + 2 * direction;
+                    if (rank == start_rank && board_[jump] == Piece::None) {
+                        push_move(from, jump, MoveFlag::DoublePawnPush);
+                    }
+                }
+            }
+            const std::array<int, 2> targets = us == Color::White ? std::array<int, 2>{from + 7, from + 9}
+                                                                   : std::array<int, 2>{from - 9, from - 7};
+            for (int to : targets) {
+                if (to < 0 || to >= 64 || std::abs(square_file(to) - file) != 1) {
+                    continue;
+                }
+                const Piece target = board_[to];
+                if (target != Piece::None && piece_color(target) == them) {
+                    if (rank == promotion_rank) {
+                        add_promotions(from, to, true);
+                    } else {
+                        push_move(from, to, MoveFlag::Capture);
+                    }
+                } else if (to == en_passant_square_) {
+                    push_move(from, to, MoveFlag::EnPassant);
+                }
+            }
+            continue;
+        }
+
+        if (type == PieceType::Knight || type == PieceType::King) {
+            Bitboard attacks = type == PieceType::Knight ? kKnightAttacks[from] : kKingAttacks[from];
+            while (attacks) {
+                const int to = pop_lsb(attacks);
+                const Piece target = board_[to];
+                if (target == Piece::None) {
+                    if (!captures_only) {
+                        push_move(from, to, MoveFlag::Quiet);
+                    }
+                } else if (piece_color(target) == them) {
+                    push_move(from, to, MoveFlag::Capture);
+                }
+            }
+            if (type == PieceType::King && !captures_only && !in_check(us)) {
+                if (us == Color::White) {
+                    if ((castling_rights_ & kCastleWhiteKing) != 0 &&
+                        board_[5] == Piece::None && board_[6] == Piece::None &&
+                        board_[7] == Piece::WRook &&
+                        !is_square_attacked(5, them) && !is_square_attacked(6, them)) {
+                        push_move(4, 6, MoveFlag::KingCastle);
+                    }
+                    if ((castling_rights_ & kCastleWhiteQueen) != 0 &&
+                        board_[3] == Piece::None && board_[2] == Piece::None && board_[1] == Piece::None &&
+                        board_[0] == Piece::WRook &&
+                        !is_square_attacked(3, them) && !is_square_attacked(2, them)) {
+                        push_move(4, 2, MoveFlag::QueenCastle);
+                    }
+                } else {
+                    if ((castling_rights_ & kCastleBlackKing) != 0 &&
+                        board_[61] == Piece::None && board_[62] == Piece::None &&
+                        board_[63] == Piece::BRook &&
+                        !is_square_attacked(61, them) && !is_square_attacked(62, them)) {
+                        push_move(60, 62, MoveFlag::KingCastle);
+                    }
+                    if ((castling_rights_ & kCastleBlackQueen) != 0 &&
+                        board_[59] == Piece::None && board_[58] == Piece::None && board_[57] == Piece::None &&
+                        board_[56] == Piece::BRook &&
+                        !is_square_attacked(59, them) && !is_square_attacked(58, them)) {
+                        push_move(60, 58, MoveFlag::QueenCastle);
+                    }
+                }
+            }
+            continue;
+        }
+
+        auto walk = [&](std::initializer_list<std::pair<int, int>> directions) {
+            for (const auto& [df, dr] : directions) {
+                int next_file = file + df;
+                int next_rank = rank + dr;
+                while (next_file >= 0 && next_file < 8 && next_rank >= 0 && next_rank < 8) {
+                    const int to = make_square(next_file, next_rank);
+                    const Piece target = board_[to];
+                    if (target == Piece::None) {
+                        if (!captures_only) {
+                            push_move(from, to, MoveFlag::Quiet);
+                        }
+                    } else {
+                        if (piece_color(target) == them) {
+                            push_move(from, to, MoveFlag::Capture);
+                        }
+                        break;
+                    }
+                    next_file += df;
+                    next_rank += dr;
+                }
+            }
+        };
+
+        if (type == PieceType::Bishop) {
+            walk({{1, 1}, {1, -1}, {-1, 1}, {-1, -1}});
+        } else if (type == PieceType::Rook) {
+            walk({{1, 0}, {-1, 0}, {0, 1}, {0, -1}});
+        } else if (type == PieceType::Queen) {
+            walk({{1, 1}, {1, -1}, {-1, 1}, {-1, -1}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}});
+        }
+    }
+
+    return moves;
+}
+
+std::vector<Move> Position::legal_moves_fast(bool captures_only) {
+    const Color us = side_to_move_;
+    const std::vector<Move> pseudo = generate_pseudo_moves(captures_only);
+    std::vector<Move> legal;
+    legal.reserve(pseudo.size());
+    for (const Move& move : pseudo) {
+        UndoState undo;
+        if (!make_move(move, undo)) {
+            continue;
+        }
+        if (!in_check(us)) {
+            legal.push_back(move);
+        }
+        unmake_move(undo);
+    }
+    return legal;
+}
+
+std::vector<Move> Position::legal_moves(bool captures_only) const {
+    Position copy = *this;
+    return copy.legal_moves_fast(captures_only);
+}
+
+std::vector<std::string> Position::legal_moves_uci(bool captures_only) const {
+    std::vector<std::string> list;
+    for (const Move& move : legal_moves(captures_only)) {
+        list.push_back(move.to_uci());
+    }
+    return list;
+}
+
+Move Position::parse_uci_move(const std::string& uci) const {
+    std::string normalized;
+    normalized.reserve(uci.size());
+    for (char ch : uci) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    for (const Move& move : legal_moves(false)) {
+        if (move.to_uci() == normalized) {
+            return move;
+        }
+    }
+    return Move::null();
+}
+
+bool Position::is_move_legal(const Move& move) const {
+    for (const Move& candidate : legal_moves(false)) {
+        if (candidate == move) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Position::apply_uci_move(const std::string& uci, std::string* error) {
+    const Move move = parse_uci_move(uci);
+    if (move.is_null()) {
+        if (error) {
+            *error = "Illegal move: " + uci;
+        }
+        return false;
+    }
+    UndoState undo;
+    if (!make_move(move, undo)) {
+        if (error) {
+            *error = "Failed to apply move.";
+        }
+        return false;
+    }
+    if (error) {
+        *error = "";
+    }
+    return true;
+}
+
+bool Position::make_move(const Move& move, UndoState& undo) {
+    if (move.from >= 64 || move.to >= 64) {
+        return false;
+    }
+    undo.board = board_;
+    undo.piece_bitboards = piece_bitboards_;
+    undo.color_bitboards = color_bitboards_;
+    undo.side_to_move = side_to_move_;
+    undo.castling_rights = castling_rights_;
+    undo.en_passant_square = en_passant_square_;
+    undo.halfmove_clock = halfmove_clock_;
+    undo.fullmove_number = fullmove_number_;
+    undo.hash = hash_;
+    undo.repetition_size = repetition_history_.size();
+
+    const Piece mover = board_[move.from];
+    if (mover == Piece::None || piece_color(mover) != side_to_move_) {
+        return false;
+    }
+
+    const Color us = side_to_move_;
+    const Color them = opposite(us);
+    const PieceType mover_type = piece_type(mover);
+    auto clear_rook_rights = [&](int square) {
+        switch (square) {
+            case 0:
+                castling_rights_ &= ~kCastleWhiteQueen;
+                break;
+            case 7:
+                castling_rights_ &= ~kCastleWhiteKing;
+                break;
+            case 56:
+                castling_rights_ &= ~kCastleBlackQueen;
+                break;
+            case 63:
+                castling_rights_ &= ~kCastleBlackKing;
+                break;
+            default:
+                break;
+        }
+    };
+
+    if (mover_type == PieceType::King) {
+        castling_rights_ &= us == Color::White
+            ? static_cast<std::uint8_t>(~(kCastleWhiteKing | kCastleWhiteQueen))
+            : static_cast<std::uint8_t>(~(kCastleBlackKing | kCastleBlackQueen));
+    } else if (mover_type == PieceType::Rook) {
+        clear_rook_rights(move.from);
+    }
+
+    if (move.is_capture()) {
+        const int capture_square = move.flag == MoveFlag::EnPassant
+            ? (us == Color::White ? move.to - 8 : move.to + 8)
+            : move.to;
+        clear_rook_rights(capture_square);
+        remove_piece(capture_square);
+    }
+
+    remove_piece(move.from);
+    remove_piece(move.to);
+
+    if (move.flag == MoveFlag::KingCastle) {
+        place_piece(move.to, mover);
+        if (us == Color::White) {
+            remove_piece(7);
+            place_piece(5, Piece::WRook);
+        } else {
+            remove_piece(63);
+            place_piece(61, Piece::BRook);
+        }
+    } else if (move.flag == MoveFlag::QueenCastle) {
+        place_piece(move.to, mover);
+        if (us == Color::White) {
+            remove_piece(0);
+            place_piece(3, Piece::WRook);
+        } else {
+            remove_piece(56);
+            place_piece(59, Piece::BRook);
+        }
+    } else if (move.is_promotion()) {
+        place_piece(move.to, make_piece(us, move.promotion));
+    } else {
+        place_piece(move.to, mover);
+    }
+
+    en_passant_square_ = kNoSquare;
+    if (move.flag == MoveFlag::DoublePawnPush) {
+        en_passant_square_ = us == Color::White ? move.from + 8 : move.from - 8;
+    }
+
+    if (mover_type == PieceType::Pawn || move.is_capture()) {
+        halfmove_clock_ = 0;
+    } else {
+        halfmove_clock_ += 1;
+    }
+
+    if (us == Color::Black) {
+        fullmove_number_ += 1;
+    }
+
+    side_to_move_ = them;
+    hash_ = compute_hash();
+    repetition_history_.push_back(hash_);
+    return true;
+}
+
+void Position::unmake_move(const UndoState& undo) {
+    board_ = undo.board;
+    piece_bitboards_ = undo.piece_bitboards;
+    color_bitboards_ = undo.color_bitboards;
+    side_to_move_ = undo.side_to_move;
+    castling_rights_ = undo.castling_rights;
+    en_passant_square_ = undo.en_passant_square;
+    halfmove_clock_ = undo.halfmove_clock;
+    fullmove_number_ = undo.fullmove_number;
+    hash_ = undo.hash;
+    repetition_history_.resize(undo.repetition_size);
+}
+
+bool Position::is_checkmate() const {
+    Position copy = *this;
+    return copy.in_check(copy.side_to_move_) && copy.legal_moves_fast(false).empty();
+}
+
+bool Position::is_stalemate() const {
+    Position copy = *this;
+    return !copy.in_check(copy.side_to_move_) && copy.legal_moves_fast(false).empty();
+}
+
+bool Position::is_draw_by_repetition() const {
+    if (repetition_history_.size() < 3) {
+        return false;
+    }
+    int matches = 1;
+    const int max_back = std::min<int>(halfmove_clock_, static_cast<int>(repetition_history_.size()) - 1);
+    for (int plies = 2; plies <= max_back; plies += 2) {
+        const std::size_t index = repetition_history_.size() - 1 - plies;
+        if (repetition_history_[index] == hash_) {
+            matches += 1;
+            if (matches >= 3) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Position::is_draw_by_fifty_move() const {
+    return halfmove_clock_ >= 100;
+}
+
+bool Position::is_insufficient_material() const {
+    int white_minor = 0;
+    int black_minor = 0;
+    int white_dark_bishop = 0;
+    int white_light_bishop = 0;
+    int black_dark_bishop = 0;
+    int black_light_bishop = 0;
+
+    for (int square = 0; square < 64; ++square) {
+        const Piece piece = board_[square];
+        if (piece == Piece::None || piece == Piece::WKing || piece == Piece::BKing) {
+            continue;
+        }
+        const PieceType type = piece_type(piece);
+        if (type == PieceType::Pawn || type == PieceType::Rook || type == PieceType::Queen) {
+            return false;
+        }
+        if (is_white(piece)) {
+            white_minor += 1;
+            if (type == PieceType::Bishop) {
+                if (((square_file(square) + square_rank(square)) & 1) == 0) {
+                    white_dark_bishop += 1;
+                } else {
+                    white_light_bishop += 1;
+                }
+            }
+        } else {
+            black_minor += 1;
+            if (type == PieceType::Bishop) {
+                if (((square_file(square) + square_rank(square)) & 1) == 0) {
+                    black_dark_bishop += 1;
+                } else {
+                    black_light_bishop += 1;
+                }
+            }
+        }
+    }
+
+    if (white_minor == 0 && black_minor == 0) {
+        return true;
+    }
+    if ((white_minor == 1 && black_minor == 0) || (white_minor == 0 && black_minor == 1)) {
+        return true;
+    }
+    if (white_minor == 1 && black_minor == 1 &&
+        (white_dark_bishop + white_light_bishop) == 1 &&
+        (black_dark_bishop + black_light_bishop) == 1) {
+        return (white_dark_bishop == 1 && black_dark_bishop == 1) ||
+               (white_light_bishop == 1 && black_light_bishop == 1);
+    }
+    return false;
+}
+
+bool Position::is_draw() const {
+    return is_stalemate() || is_draw_by_repetition() || is_draw_by_fifty_move() || is_insufficient_material();
+}
+
+}  // namespace deadfish
+
+namespace deadfish {
+
+namespace {
+
+int mobility_weight(PieceType type) {
+    switch (type) {
+        case PieceType::Knight:
+            return 4;
+        case PieceType::Bishop:
+            return 5;
+        case PieceType::Rook:
+            return 3;
+        case PieceType::Queen:
+            return 2;
+        case PieceType::King:
+            return 1;
+        case PieceType::Pawn:
+            return 1;
+        case PieceType::None:
+        default:
+            return 0;
+    }
+}
+
+int count_piece_mobility(const Position& position, int square, Piece piece) {
+    const Color color = piece_color(piece);
+    const PieceType type = piece_type(piece);
+
+    if (type == PieceType::Knight) {
+        int count = 0;
+        Bitboard attacks = kKnightAttacks[square];
+        while (attacks) {
+            const int target = pop_lsb(attacks);
+            const Piece target_piece = position.piece_at(target);
+            if (target_piece == Piece::None || piece_color(target_piece) != color) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+    if (type == PieceType::King) {
+        int count = 0;
+        Bitboard attacks = kKingAttacks[square];
+        while (attacks) {
+            const int target = pop_lsb(attacks);
+            const Piece target_piece = position.piece_at(target);
+            if (target_piece == Piece::None || piece_color(target_piece) != color) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+    if (type == PieceType::Pawn) {
+        return std::popcount(kPawnAttacks[static_cast<std::size_t>(color)][square]);
+    }
+
+    int mobility = 0;
+    auto count_ray = [&](int df, int dr) {
+        int file = square_file(square) + df;
+        int rank = square_rank(square) + dr;
+        while (file >= 0 && file < 8 && rank >= 0 && rank < 8) {
+            const int target = make_square(file, rank);
+            const Piece target_piece = position.piece_at(target);
+            if (target_piece == Piece::None) {
+                mobility += 1;
+            } else {
+                if (piece_color(target_piece) != color) {
+                    mobility += 1;
+                }
+                break;
+            }
+            file += df;
+            rank += dr;
+        }
+    };
+
+    if (type == PieceType::Bishop || type == PieceType::Queen) {
+        count_ray(1, 1);
+        count_ray(1, -1);
+        count_ray(-1, 1);
+        count_ray(-1, -1);
+    }
+    if (type == PieceType::Rook || type == PieceType::Queen) {
+        count_ray(1, 0);
+        count_ray(-1, 0);
+        count_ray(0, 1);
+        count_ray(0, -1);
+    }
+    return mobility;
+}
+
+int count_center_control(const Position& position, int square, Piece piece) {
+    const PieceType type = piece_type(piece);
+    const Color color = piece_color(piece);
+    int score = is_center_square(square) ? 14 : is_extended_center_square(square) ? 6 : 0;
+    auto add_if_center = [&](int target) {
+        if (is_center_square(target)) {
+            score += 4;
+        } else if (is_extended_center_square(target)) {
+            score += 2;
+        }
+    };
+
+    if (type == PieceType::Knight) {
+        Bitboard attacks = kKnightAttacks[square];
+        while (attacks) {
+            add_if_center(pop_lsb(attacks));
+        }
+        return score;
+    }
+    if (type == PieceType::King) {
+        Bitboard attacks = kKingAttacks[square];
+        while (attacks) {
+            add_if_center(pop_lsb(attacks));
+        }
+        return score;
+    }
+    if (type == PieceType::Pawn) {
+        Bitboard attacks = kPawnAttacks[static_cast<std::size_t>(color)][square];
+        while (attacks) {
+            add_if_center(pop_lsb(attacks));
+        }
+        return score;
+    }
+
+    auto walk = [&](int df, int dr) {
+        int file = square_file(square) + df;
+        int rank = square_rank(square) + dr;
+        while (file >= 0 && file < 8 && rank >= 0 && rank < 8) {
+            const int target = make_square(file, rank);
+            add_if_center(target);
+            if (position.piece_at(target) != Piece::None) {
+                break;
+            }
+            file += df;
+            rank += dr;
+        }
+    };
+
+    if (type == PieceType::Bishop || type == PieceType::Queen) {
+        walk(1, 1);
+        walk(1, -1);
+        walk(-1, 1);
+        walk(-1, -1);
+    }
+    if (type == PieceType::Rook || type == PieceType::Queen) {
+        walk(1, 0);
+        walk(-1, 0);
+        walk(0, 1);
+        walk(0, -1);
+    }
+    return score;
+}
+
+int count_king_ring_attacks(const Position& position, int king_square, Color attacker) {
+    if (king_square == kNoSquare) {
+        return 0;
+    }
+    int attacks = 0;
+    Bitboard ring = kKingAttacks[king_square] | bit_at(king_square);
+    while (ring) {
+        const int square = pop_lsb(ring);
+        if (position.is_square_attacked(square, attacker)) {
+            attacks += 1;
+        }
+    }
+    return attacks;
+}
+
+}  // namespace
+
+int Position::evaluate_absolute() const {
+    struct SideEval {
+        int middle = 0;
+        int endgame = 0;
+        int material = 0;
+        int center = 0;
+        int mobility = 0;
+        int king_safety = 0;
+        int pawn_structure = 0;
+        int passed_pawns = 0;
+        int rook_files = 0;
+        int bishop_pair = 0;
+        int simplification = 0;
+        int king_square = kNoSquare;
+        int bishops = 0;
+        std::array<int, 8> pawn_files{};
+        std::vector<int> pawns;
+        std::vector<int> rooks;
+    };
+
+    SideEval white;
+    SideEval black;
+
+    for (int square = 0; square < 64; ++square) {
+        const Piece piece = board_[square];
+        if (piece == Piece::None) {
+            continue;
+        }
+        const Color color = piece_color(piece);
+        SideEval& side = color == Color::White ? white : black;
+        const PieceType type = piece_type(piece);
+        side.material += kPieceValues[static_cast<std::size_t>(type)];
+        side.middle += kPieceValues[static_cast<std::size_t>(type)];
+        side.endgame += kPieceValuesEndgame[static_cast<std::size_t>(type)];
+
+        switch (type) {
+            case PieceType::Pawn:
+                side.middle += square_table_value(kPawnTable, square, color);
+                side.endgame += square_table_value(kPawnTable, square, color);
+                side.pawn_files[square_file(square)] += 1;
+                side.pawns.push_back(square);
+                break;
+            case PieceType::Knight:
+                side.middle += square_table_value(kKnightTable, square, color);
+                side.endgame += square_table_value(kKnightTable, square, color) / 2;
+                break;
+            case PieceType::Bishop:
+                side.middle += square_table_value(kBishopTable, square, color);
+                side.endgame += square_table_value(kBishopTable, square, color);
+                side.bishops += 1;
+                break;
+            case PieceType::Rook:
+                side.middle += square_table_value(kRookTable, square, color);
+                side.endgame += square_table_value(kRookTable, square, color);
+                side.rooks.push_back(square);
+                break;
+            case PieceType::Queen:
+                side.middle += square_table_value(kQueenTable, square, color);
+                side.endgame += square_table_value(kQueenTable, square, color);
+                break;
+            case PieceType::King:
+                side.middle += square_table_value(kKingMiddleTable, square, color);
+                side.endgame += square_table_value(kKingEndTable, square, color);
+                side.king_square = square;
+                break;
+            case PieceType::None:
+            default:
+                break;
+        }
+
+        side.mobility += count_piece_mobility(*this, square, piece) * mobility_weight(type);
+        side.center += count_center_control(*this, square, piece);
+    }
+
+    if (white.bishops >= 2) {
+        white.bishop_pair += 30;
+    }
+    if (black.bishops >= 2) {
+        black.bishop_pair += 30;
+    }
+
+    auto evaluate_pawns = [&](Color color, SideEval& side, const SideEval& enemy) {
+        for (int square : side.pawns) {
+            const int file = square_file(square);
+            const int rank = square_rank(square);
+            if (side.pawn_files[file] > 1) {
+                side.pawn_structure -= 12 * (side.pawn_files[file] - 1);
+            }
+            const bool has_left = file > 0 && side.pawn_files[file - 1] > 0;
+            const bool has_right = file < 7 && side.pawn_files[file + 1] > 0;
+            if (!has_left && !has_right) {
+                side.pawn_structure -= 14;
+            }
+
+            bool passed = true;
+            for (int scan_file = std::max(0, file - 1); scan_file <= std::min(7, file + 1); ++scan_file) {
+                if (enemy.pawn_files[scan_file] == 0) {
+                    continue;
+                }
+                if (color == Color::White) {
+                    for (int scan_rank = rank + 1; scan_rank < 8; ++scan_rank) {
+                        if (board_[make_square(scan_file, scan_rank)] == Piece::BPawn) {
+                            passed = false;
+                            break;
+                        }
+                    }
+                } else {
+                    for (int scan_rank = rank - 1; scan_rank >= 0; --scan_rank) {
+                        if (board_[make_square(scan_file, scan_rank)] == Piece::WPawn) {
+                            passed = false;
+                            break;
+                        }
+                    }
+                }
+                if (!passed) {
+                    break;
+                }
+            }
+            if (passed) {
+                const int advance = color == Color::White ? rank : 7 - rank;
+                side.passed_pawns += kPassedPawnBonus[advance];
+            }
+        }
+    };
+
+    evaluate_pawns(Color::White, white, black);
+    evaluate_pawns(Color::Black, black, white);
+
+    auto evaluate_rooks = [&](SideEval& side, const SideEval& enemy) {
+        for (int square : side.rooks) {
+            const int file = square_file(square);
+            const bool friendly_pawn = side.pawn_files[file] > 0;
+            const bool enemy_pawn = enemy.pawn_files[file] > 0;
+            if (!friendly_pawn && !enemy_pawn) {
+                side.rook_files += 26;
+            } else if (!friendly_pawn) {
+                side.rook_files += 14;
+            }
+            if (is_center_square(square) || is_extended_center_square(square)) {
+                side.rook_files += 4;
+            }
+        }
+    };
+
+    evaluate_rooks(white, black);
+    evaluate_rooks(black, white);
+
+    auto evaluate_king = [&](Color color, SideEval& side, const SideEval& enemy) {
+        if (side.king_square == kNoSquare) {
+            return;
+        }
+        const int rank = square_rank(side.king_square);
+        const int file = square_file(side.king_square);
+        const int home_rank = color == Color::White ? 0 : 7;
+        if (rank == home_rank && (file == 6 || file == 2)) {
+            side.king_safety += 28;
+        }
+        const int shield_rank = color == Color::White ? rank + 1 : rank - 1;
+        for (int delta = -1; delta <= 1; ++delta) {
+            const int shield_file = file + delta;
+            if (shield_rank < 0 || shield_rank >= 8 || shield_file < 0 || shield_file >= 8) {
+                continue;
+            }
+            if (board_[make_square(shield_file, shield_rank)] == make_piece(color, PieceType::Pawn)) {
+                side.king_safety += 10;
+            }
+        }
+        side.king_safety -= count_king_ring_attacks(*this, side.king_square, opposite(color)) * 12;
+        if (enemy.material > side.material && phase_value(*this) > 10) {
+            side.king_safety -= 10;
+        }
+    };
+
+    evaluate_king(Color::White, white, black);
+    evaluate_king(Color::Black, black, white);
+
+    const int phase = phase_value(*this);
+    if (phase <= 10) {
+        const int white_edge = white.material - black.material;
+        const int black_edge = black.material - white.material;
+        if (white_edge > 0) {
+            white.simplification += white_edge / 20;
+        }
+        if (black_edge > 0) {
+            black.simplification += black_edge / 20;
+        }
+    }
+
+    const int white_tapered = (white.middle * phase + white.endgame * (24 - phase)) / 24;
+    const int black_tapered = (black.middle * phase + black.endgame * (24 - phase)) / 24;
+    int score = white_tapered - black_tapered;
+    score += white.mobility - black.mobility;
+    score += white.center - black.center;
+    score += white.king_safety - black.king_safety;
+    score += white.pawn_structure - black.pawn_structure;
+    score += white.passed_pawns - black.passed_pawns;
+    score += white.rook_files - black.rook_files;
+    score += white.bishop_pair - black.bishop_pair;
+    score += white.simplification - black.simplification;
+    score += side_to_move_ == Color::White ? 10 : -10;
+    return score;
+}
+
+int Position::evaluate_relative() const {
+    const int absolute = evaluate_absolute();
+    return side_to_move_ == Color::White ? absolute : -absolute;
+}
+
+}  // namespace deadfish
