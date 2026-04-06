@@ -2,19 +2,29 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
+#include <string>
 #include <string_view>
-#include <unordered_map>
+#include <system_error>
+#ifdef DEADFISH_WITH_SYZYGY
+extern "C" {
+#include "tbprobe.h"
+}
+#endif
 
 namespace deadfish {
 
@@ -29,6 +39,8 @@ constexpr std::uint8_t kCastleWhiteQueen = 1u << 1;
 constexpr std::uint8_t kCastleBlackKing = 1u << 2;
 constexpr std::uint8_t kCastleBlackQueen = 1u << 3;
 constexpr std::string_view kCanonicalStartFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+#include "deadfish/polyglot_randoms.inc"
 
 constexpr Color opposite(Color color) {
     return color == Color::White ? Color::Black : Color::White;
@@ -425,6 +437,532 @@ namespace deadfish {
 
 namespace {
 
+constexpr int kHistoryMax = 32768;
+constexpr int kDefaultAspirationWindow = 24;
+constexpr int kWinningSeeBonus = 130000;
+constexpr int kLosingCaptureBase = 45000;
+
+enum class TTFlag : std::uint8_t {
+    Exact = 0,
+    Lower,
+    Upper,
+};
+
+struct TTEntry {
+    int depth = 0;
+    int score = 0;
+    TTFlag flag = TTFlag::Exact;
+    Move best_move = Move::null();
+};
+
+struct TTSlot {
+    std::uint64_t key = 0;
+    int depth = std::numeric_limits<int>::min();
+    int score = 0;
+    TTFlag flag = TTFlag::Exact;
+    Move best_move = Move::null();
+    std::uint8_t age = 0;
+};
+
+int score_to_tt(int score, int ply) {
+    if (score > kMateScore - kMaxPly) {
+        return score + ply;
+    }
+    if (score < -kMateScore + kMaxPly) {
+        return score - ply;
+    }
+    return score;
+}
+
+int score_from_tt(int score, int ply) {
+    if (score > kMateScore - kMaxPly) {
+        return score - ply;
+    }
+    if (score < -kMateScore + kMaxPly) {
+        return score + ply;
+    }
+    return score;
+}
+
+class FixedHashTable {
+public:
+    void resize_mb(int hash_mb) {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(std::max(1, hash_mb)) * 1024ULL * 1024ULL;
+        std::size_t count = static_cast<std::size_t>(bytes / sizeof(TTSlot));
+        count = std::max<std::size_t>(1, std::bit_floor(count));
+        slots_.assign(count, TTSlot{});
+        mask_ = count - 1;
+        age_ = 0;
+    }
+
+    void clear() {
+        std::fill(slots_.begin(), slots_.end(), TTSlot{});
+    }
+
+    void new_search() {
+        age_ = static_cast<std::uint8_t>(age_ + 1);
+    }
+
+    std::optional<TTEntry> probe(std::uint64_t key, int ply) const {
+        if (slots_.empty()) {
+            return std::nullopt;
+        }
+        const TTSlot& slot = slots_[static_cast<std::size_t>(key) & mask_];
+        if (slot.depth == std::numeric_limits<int>::min() || slot.key != key) {
+            return std::nullopt;
+        }
+        return TTEntry{
+            .depth = slot.depth,
+            .score = score_from_tt(slot.score, ply),
+            .flag = slot.flag,
+            .best_move = slot.best_move,
+        };
+    }
+
+    void store(std::uint64_t key, int depth, int score, TTFlag flag, Move best_move, int ply) {
+        if (slots_.empty()) {
+            return;
+        }
+        TTSlot& slot = slots_[static_cast<std::size_t>(key) & mask_];
+        const bool replace = slot.depth == std::numeric_limits<int>::min() || slot.key == key ||
+            slot.age != age_ || depth >= slot.depth;
+        if (!replace) {
+            return;
+        }
+        slot.key = key;
+        slot.depth = depth;
+        slot.score = score_to_tt(score, ply);
+        slot.flag = flag;
+        slot.best_move = best_move;
+        slot.age = age_;
+    }
+
+private:
+    std::vector<TTSlot> slots_{};
+    std::size_t mask_ = 0;
+    std::uint8_t age_ = 0;
+};
+
+struct PolyglotEntry {
+    std::uint64_t key = 0;
+    std::uint16_t move = 0;
+    std::uint16_t weight = 0;
+    std::uint32_t learn = 0;
+};
+
+struct PolyglotBookCache {
+    std::filesystem::path loaded_path{};
+    std::vector<PolyglotEntry> entries{};
+};
+
+struct TablebaseRootResult {
+    Move move = Move::null();
+    int score = 0;
+    bool ok = false;
+};
+
+}  // namespace
+
+struct EngineState {
+    EngineOptions options{};
+    std::atomic<bool> stop_requested = false;
+    FixedHashTable tt{};
+    PolyglotBookCache book{};
+#ifdef DEADFISH_WITH_SYZYGY
+    std::mutex syzygy_mutex{};
+    std::string syzygy_loaded_path{};
+    bool syzygy_initialized = false;
+#endif
+};
+
+namespace {
+
+std::filesystem::path normalize_path(const std::filesystem::path& path) {
+    std::error_code error;
+    const std::filesystem::path normalized = std::filesystem::weakly_canonical(path, error);
+    return error ? path.lexically_normal() : normalized;
+}
+
+std::filesystem::path resolve_book_path(const EngineOptions& options) {
+    auto resolve_if_exists = [](const std::filesystem::path& path) -> std::filesystem::path {
+        std::error_code error;
+        if (!path.empty() && std::filesystem::exists(path, error)) {
+            return normalize_path(path);
+        }
+        return {};
+    };
+
+    if (!options.book_path.empty()) {
+        return resolve_if_exists(options.book_path);
+    }
+
+    for (const std::filesystem::path& candidate : {
+             std::filesystem::path("data/book.bin"),
+             std::filesystem::path("../data/book.bin"),
+         }) {
+        const std::filesystem::path resolved = resolve_if_exists(candidate);
+        if (!resolved.empty()) {
+            return resolved;
+        }
+    }
+    return {};
+}
+
+void clear_book_cache(EngineState& state) {
+    state.book.loaded_path.clear();
+    state.book.entries.clear();
+}
+
+std::uint64_t read_be_u64(const unsigned char* data) {
+    std::uint64_t value = 0;
+    for (int index = 0; index < 8; ++index) {
+        value = (value << 8) | static_cast<std::uint64_t>(data[index]);
+    }
+    return value;
+}
+
+std::uint16_t read_be_u16(const unsigned char* data) {
+    return static_cast<std::uint16_t>((static_cast<unsigned>(data[0]) << 8) | static_cast<unsigned>(data[1]));
+}
+
+std::uint32_t read_be_u32(const unsigned char* data) {
+    std::uint32_t value = 0;
+    for (int index = 0; index < 4; ++index) {
+        value = (value << 8) | static_cast<std::uint32_t>(data[index]);
+    }
+    return value;
+}
+
+bool ensure_book_loaded(EngineState& state) {
+    const std::filesystem::path path = resolve_book_path(state.options);
+    if (path.empty()) {
+        clear_book_cache(state);
+        return false;
+    }
+    if (!state.book.loaded_path.empty() && normalize_path(state.book.loaded_path) == path) {
+        return !state.book.entries.empty();
+    }
+
+    clear_book_cache(state);
+    state.book.loaded_path = path;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    std::array<unsigned char, 16> buffer{};
+    while (input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()))) {
+        state.book.entries.push_back(PolyglotEntry{
+            .key = read_be_u64(buffer.data()),
+            .move = read_be_u16(buffer.data() + 8),
+            .weight = read_be_u16(buffer.data() + 10),
+            .learn = read_be_u32(buffer.data() + 12),
+        });
+    }
+    return !state.book.entries.empty();
+}
+
+int polyglot_piece_index(Piece piece) {
+    switch (piece) {
+        case Piece::BPawn:
+            return 0;
+        case Piece::WPawn:
+            return 1;
+        case Piece::BKnight:
+            return 2;
+        case Piece::WKnight:
+            return 3;
+        case Piece::BBishop:
+            return 4;
+        case Piece::WBishop:
+            return 5;
+        case Piece::BRook:
+            return 6;
+        case Piece::WRook:
+            return 7;
+        case Piece::BQueen:
+            return 8;
+        case Piece::WQueen:
+            return 9;
+        case Piece::BKing:
+            return 10;
+        case Piece::WKing:
+            return 11;
+        case Piece::None:
+        default:
+            return -1;
+    }
+}
+
+bool has_polyglot_ep_capture(const Position& position) {
+    const int ep = position.en_passant_square();
+    if (ep == kNoSquare) {
+        return false;
+    }
+    const int file = square_file(ep);
+    if (position.side_to_move() == Color::White) {
+        if (file > 0 && position.piece_at(ep - 9) == Piece::WPawn) {
+            return true;
+        }
+        if (file < 7 && position.piece_at(ep - 7) == Piece::WPawn) {
+            return true;
+        }
+    } else {
+        if (file > 0 && position.piece_at(ep + 7) == Piece::BPawn) {
+            return true;
+        }
+        if (file < 7 && position.piece_at(ep + 9) == Piece::BPawn) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint64_t polyglot_hash(const Position& position) {
+    std::uint64_t hash = 0;
+    for (int square = 0; square < 64; ++square) {
+        const Piece piece = position.piece_at(square);
+        const int index = polyglot_piece_index(piece);
+        if (index >= 0) {
+            hash ^= kPolyglotRandom[64 * index + square];
+        }
+    }
+    if ((position.castling_rights() & kCastleWhiteKing) != 0) {
+        hash ^= kPolyglotRandom[768];
+    }
+    if ((position.castling_rights() & kCastleWhiteQueen) != 0) {
+        hash ^= kPolyglotRandom[769];
+    }
+    if ((position.castling_rights() & kCastleBlackKing) != 0) {
+        hash ^= kPolyglotRandom[770];
+    }
+    if ((position.castling_rights() & kCastleBlackQueen) != 0) {
+        hash ^= kPolyglotRandom[771];
+    }
+    if (has_polyglot_ep_capture(position) && position.en_passant_square() != kNoSquare) {
+        hash ^= kPolyglotRandom[772 + square_file(position.en_passant_square())];
+    }
+    if (position.side_to_move() == Color::White) {
+        hash ^= kPolyglotRandom[780];
+    }
+    return hash;
+}
+
+Move decode_polyglot_move(const Position& position, std::uint16_t raw_move) {
+    const int from = (raw_move >> 6) & 0x3f;
+    const int to = raw_move & 0x3f;
+    PieceType promotion = PieceType::None;
+    switch ((raw_move >> 12) & 0x7) {
+        case 1:
+            promotion = PieceType::Knight;
+            break;
+        case 2:
+            promotion = PieceType::Bishop;
+            break;
+        case 3:
+            promotion = PieceType::Rook;
+            break;
+        case 4:
+            promotion = PieceType::Queen;
+            break;
+        default:
+            break;
+    }
+
+    for (const Move& move : position.legal_moves(false)) {
+        if (move.from == from && move.to == to && move.promotion == promotion) {
+            return move;
+        }
+    }
+
+    for (const Move& move : position.legal_moves(false)) {
+        if (move.from != from || move.promotion != promotion) {
+            continue;
+        }
+        if (move.flag == MoveFlag::KingCastle && (to == 7 || to == 63 || to == 6 || to == 62)) {
+            return move;
+        }
+        if (move.flag == MoveFlag::QueenCastle && (to == 0 || to == 56 || to == 2 || to == 58)) {
+            return move;
+        }
+    }
+    return Move::null();
+}
+
+Move probe_book_move(const Position& position, EngineState& state) {
+    if (!state.options.own_book || !ensure_book_loaded(state)) {
+        return Move::null();
+    }
+
+    const std::uint64_t key = polyglot_hash(position);
+    auto lower = std::lower_bound(state.book.entries.begin(), state.book.entries.end(), key,
+        [](const PolyglotEntry& entry, std::uint64_t value) {
+            return entry.key < value;
+        });
+
+    Move best_move = Move::null();
+    std::uint16_t best_weight = 0;
+    for (auto it = lower; it != state.book.entries.end() && it->key == key; ++it) {
+        const Move candidate = decode_polyglot_move(position, it->move);
+        if (!candidate.is_null() && it->weight >= best_weight) {
+            best_weight = it->weight;
+            best_move = candidate;
+        }
+    }
+    return best_move;
+}
+
+#ifdef DEADFISH_WITH_SYZYGY
+struct TbPosition {
+    std::uint64_t white = 0;
+    std::uint64_t black = 0;
+    std::uint64_t kings = 0;
+    std::uint64_t queens = 0;
+    std::uint64_t rooks = 0;
+    std::uint64_t bishops = 0;
+    std::uint64_t knights = 0;
+    std::uint64_t pawns = 0;
+    unsigned rule50 = 0;
+    unsigned castling = 0;
+    unsigned ep = 0;
+    bool turn = false;
+};
+
+TbPosition make_tb_position(const Position& position) {
+    return TbPosition{
+        .white = position.occupancy(Color::White),
+        .black = position.occupancy(Color::Black),
+        .kings = position.piece_bitboard(Piece::WKing) | position.piece_bitboard(Piece::BKing),
+        .queens = position.piece_bitboard(Piece::WQueen) | position.piece_bitboard(Piece::BQueen),
+        .rooks = position.piece_bitboard(Piece::WRook) | position.piece_bitboard(Piece::BRook),
+        .bishops = position.piece_bitboard(Piece::WBishop) | position.piece_bitboard(Piece::BBishop),
+        .knights = position.piece_bitboard(Piece::WKnight) | position.piece_bitboard(Piece::BKnight),
+        .pawns = position.piece_bitboard(Piece::WPawn) | position.piece_bitboard(Piece::BPawn),
+        .rule50 = static_cast<unsigned>(position.halfmove_clock()),
+        .castling = static_cast<unsigned>(position.castling_rights()),
+        .ep = position.en_passant_square() == kNoSquare ? 0u : static_cast<unsigned>(position.en_passant_square()),
+        .turn = position.side_to_move() == Color::White,
+    };
+}
+
+bool ensure_syzygy_ready(EngineState& state) {
+    std::lock_guard<std::mutex> guard(state.syzygy_mutex);
+    if (state.options.syzygy_path.empty()) {
+        if (state.syzygy_initialized) {
+            tb_free();
+            state.syzygy_initialized = false;
+            state.syzygy_loaded_path.clear();
+        }
+        return false;
+    }
+    if (state.syzygy_initialized && state.syzygy_loaded_path == state.options.syzygy_path) {
+        return TB_LARGEST > 0;
+    }
+    if (state.syzygy_initialized) {
+        tb_free();
+        state.syzygy_initialized = false;
+        state.syzygy_loaded_path.clear();
+    }
+    const bool ok = tb_init(state.options.syzygy_path.c_str());
+    state.syzygy_initialized = ok;
+    state.syzygy_loaded_path = ok ? state.options.syzygy_path : std::string();
+    return ok && TB_LARGEST > 0;
+}
+
+bool can_probe_tablebase(const Position& position, EngineState& state) {
+    if (state.options.syzygy_probe_limit <= 0) {
+        return false;
+    }
+    if (!ensure_syzygy_ready(state)) {
+        return false;
+    }
+    const int limit = std::min<int>(state.options.syzygy_probe_limit, static_cast<int>(TB_LARGEST));
+    return limit > 0 && position.piece_count() <= limit && position.castling_rights() == 0;
+}
+
+int tb_wdl_to_score(unsigned wdl) {
+    switch (wdl) {
+        case TB_WIN:
+            return 20000;
+        case TB_CURSED_WIN:
+            return 15000;
+        case TB_BLESSED_LOSS:
+            return -15000;
+        case TB_LOSS:
+            return -20000;
+        case TB_DRAW:
+        default:
+            return 0;
+    }
+}
+
+std::optional<int> probe_tablebase_wdl(const Position& position, EngineState& state) {
+    if (!can_probe_tablebase(position, state) || position.halfmove_clock() != 0) {
+        return std::nullopt;
+    }
+    const TbPosition tb = make_tb_position(position);
+    const unsigned result = tb_probe_wdl(
+        tb.white, tb.black, tb.kings, tb.queens, tb.rooks, tb.bishops, tb.knights, tb.pawns,
+        tb.rule50, tb.castling, tb.ep, tb.turn);
+    if (result == TB_RESULT_FAILED) {
+        return std::nullopt;
+    }
+    return tb_wdl_to_score(result);
+}
+
+TablebaseRootResult probe_tablebase_root(const Position& position, EngineState& state) {
+    TablebaseRootResult result;
+    if (!can_probe_tablebase(position, state)) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> guard(state.syzygy_mutex);
+    const TbPosition tb = make_tb_position(position);
+    unsigned alternatives[TB_MAX_MOVES]{};
+    const unsigned probe = tb_probe_root(
+        tb.white, tb.black, tb.kings, tb.queens, tb.rooks, tb.bishops, tb.knights, tb.pawns,
+        tb.rule50, tb.castling, tb.ep, tb.turn, alternatives);
+    if (probe == TB_RESULT_FAILED) {
+        return result;
+    }
+
+    const int from = static_cast<int>(TB_GET_FROM(probe));
+    const int to = static_cast<int>(TB_GET_TO(probe));
+    PieceType promotion = PieceType::None;
+    switch (TB_GET_PROMOTES(probe)) {
+        case TB_PROMOTES_KNIGHT:
+            promotion = PieceType::Knight;
+            break;
+        case TB_PROMOTES_BISHOP:
+            promotion = PieceType::Bishop;
+            break;
+        case TB_PROMOTES_ROOK:
+            promotion = PieceType::Rook;
+            break;
+        case TB_PROMOTES_QUEEN:
+            promotion = PieceType::Queen;
+            break;
+        default:
+            break;
+    }
+    for (const Move& move : position.legal_moves(false)) {
+        if (move.from == from && move.to == to && move.promotion == promotion) {
+            result.move = move;
+            break;
+        }
+    }
+    if (result.move.is_null()) {
+        return result;
+    }
+
+    const int dtz = static_cast<int>(TB_GET_DTZ(probe));
+    const int base = tb_wdl_to_score(TB_GET_WDL(probe));
+    result.score = base > 0 ? base - dtz : base < 0 ? base + dtz : 0;
+    result.ok = true;
+    return result;
+}
+#endif
+
 struct SearchNodeResult {
     int score = 0;
     Move best_move = Move::null();
@@ -441,43 +979,37 @@ SearchNodeResult node_result(int score = 0, bool completed = true, Move best_mov
     return result;
 }
 
-enum class TTFlag : std::uint8_t {
-    Exact = 0,
-    Lower,
-    Upper,
-};
-
-struct TTEntry {
-    int depth = 0;
-    int score = 0;
-    TTFlag flag = TTFlag::Exact;
-    Move best_move = Move::null();
-};
-
 struct SearchContext {
+    EngineState* state = nullptr;
     SearchLimits limits{};
     SearchCallback callback{};
     std::chrono::steady_clock::time_point start_time{};
     std::uint64_t nodes = 0;
     bool stop = false;
-    std::unordered_map<std::uint64_t, TTEntry> tt{};
+    int soft_time_ms = 0;
+    int hard_time_ms = 0;
     std::array<std::array<Move, 2>, kMaxPly> killers{};
     std::array<std::array<std::array<int, 64>, 64>, 2> history{};
 };
 
+int elapsed_ms(const SearchContext& context) {
+    return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - context.start_time).count());
+}
+
 bool should_stop(SearchContext& context) {
-    if (context.stop || context.limits.time_limit_ms <= 0) {
-        return context.stop;
+    if (context.stop || (context.state && context.state->stop_requested.load(std::memory_order_relaxed))) {
+        context.stop = true;
+        return true;
     }
-    if ((context.nodes & 2047ULL) != 0) {
-        return false;
-    }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - context.start_time).count();
-    if (elapsed >= context.limits.time_limit_ms) {
+    if (context.hard_time_ms > 0 && (context.nodes & 2047ULL) == 0 && elapsed_ms(context) >= context.hard_time_ms) {
         context.stop = true;
     }
     return context.stop;
+}
+
+bool soft_limit_reached(const SearchContext& context) {
+    return context.soft_time_ms > 0 && elapsed_ms(context) >= context.soft_time_ms;
 }
 
 Piece captured_piece_for_move(const Position& position, const Move& move) {
@@ -491,6 +1023,152 @@ int move_history_bonus(int depth) {
     return depth * depth + 4 * depth;
 }
 
+int move_history_penalty(int depth) {
+    return -(depth * depth + 2 * depth);
+}
+
+void update_history_value(int& entry, int delta) {
+    entry = std::clamp(entry + delta, -kHistoryMax, kHistoryMax);
+}
+
+Bitboard attacks_to(const Position& position, int square, Bitboard occ, Color by_color) {
+    Bitboard attackers = 0;
+    const int file = square_file(square);
+    auto present = [&](int from) {
+        return from >= 0 && from < 64 && (occ & bit_at(from)) != 0;
+    };
+
+    if (by_color == Color::White) {
+        if (file > 0 && square >= 9 && present(square - 9) && position.piece_at(square - 9) == Piece::WPawn) {
+            attackers |= bit_at(square - 9);
+        }
+        if (file < 7 && square >= 7 && present(square - 7) && position.piece_at(square - 7) == Piece::WPawn) {
+            attackers |= bit_at(square - 7);
+        }
+    } else {
+        if (file > 0 && square <= 55 && present(square + 7) && position.piece_at(square + 7) == Piece::BPawn) {
+            attackers |= bit_at(square + 7);
+        }
+        if (file < 7 && square <= 54 && present(square + 9) && position.piece_at(square + 9) == Piece::BPawn) {
+            attackers |= bit_at(square + 9);
+        }
+    }
+
+    Bitboard knights = kKnightAttacks[square];
+    while (knights) {
+        const int from = pop_lsb(knights);
+        if (present(from)) {
+            const Piece piece = position.piece_at(from);
+            if (piece != Piece::None && piece_color(piece) == by_color && piece_type(piece) == PieceType::Knight) {
+                attackers |= bit_at(from);
+            }
+        }
+    }
+
+    Bitboard kings = kKingAttacks[square];
+    while (kings) {
+        const int from = pop_lsb(kings);
+        if (present(from)) {
+            const Piece piece = position.piece_at(from);
+            if (piece != Piece::None && piece_color(piece) == by_color && piece_type(piece) == PieceType::King) {
+                attackers |= bit_at(from);
+            }
+        }
+    }
+
+    auto ray_attackers = [&](int df, int dr, PieceType a, PieceType b) {
+        int next_file = file + df;
+        int next_rank = square_rank(square) + dr;
+        while (next_file >= 0 && next_file < 8 && next_rank >= 0 && next_rank < 8) {
+            const int from = make_square(next_file, next_rank);
+            if (present(from)) {
+                const Piece piece = position.piece_at(from);
+                if (piece != Piece::None && piece_color(piece) == by_color) {
+                    const PieceType type = piece_type(piece);
+                    if (type == a || type == b) {
+                        attackers |= bit_at(from);
+                    }
+                }
+                break;
+            }
+            next_file += df;
+            next_rank += dr;
+        }
+    };
+
+    ray_attackers(1, 0, PieceType::Rook, PieceType::Queen);
+    ray_attackers(-1, 0, PieceType::Rook, PieceType::Queen);
+    ray_attackers(0, 1, PieceType::Rook, PieceType::Queen);
+    ray_attackers(0, -1, PieceType::Rook, PieceType::Queen);
+    ray_attackers(1, 1, PieceType::Bishop, PieceType::Queen);
+    ray_attackers(1, -1, PieceType::Bishop, PieceType::Queen);
+    ray_attackers(-1, 1, PieceType::Bishop, PieceType::Queen);
+    ray_attackers(-1, -1, PieceType::Bishop, PieceType::Queen);
+    return attackers;
+}
+
+std::optional<std::pair<int, Piece>> least_valuable_attacker(const Position& position, Bitboard attackers, Color color) {
+    for (PieceType type : {PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen, PieceType::King}) {
+        Bitboard candidates = attackers;
+        while (candidates) {
+            const int from = pop_lsb(candidates);
+            const Piece piece = position.piece_at(from);
+            if (piece != Piece::None && piece_color(piece) == color && piece_type(piece) == type) {
+                return std::make_pair(from, piece);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+int see_value(const Position& position, const Move& move) {
+    const Piece victim = captured_piece_for_move(position, move);
+    if (victim == Piece::None && !move.is_promotion()) {
+        return 0;
+    }
+
+    constexpr int kMaxSeeDepth = 32;
+    int gain[kMaxSeeDepth]{};
+    Bitboard occ = position.occupancy();
+    const Color us = position.side_to_move();
+    const Color them = opposite(us);
+    const int target = move.to;
+    const int capture_square = move.flag == MoveFlag::EnPassant
+        ? (us == Color::White ? target - 8 : target + 8)
+        : target;
+
+    PieceType attacker_type = move.is_promotion() ? move.promotion : piece_type(position.piece_at(move.from));
+    gain[0] = kPieceValues[static_cast<std::size_t>(piece_type(victim))];
+    if (move.is_promotion()) {
+        gain[0] += kPieceValues[static_cast<std::size_t>(move.promotion)] - kPieceValues[static_cast<std::size_t>(PieceType::Pawn)];
+    }
+
+    occ &= ~bit_at(move.from);
+    occ &= ~bit_at(capture_square);
+    occ |= bit_at(target);
+
+    Color side = them;
+    int depth = 0;
+    while (depth + 1 < kMaxSeeDepth) {
+        const Bitboard attackers = attacks_to(position, target, occ, side) & position.occupancy(side);
+        const auto attacker = least_valuable_attacker(position, attackers, side);
+        if (!attacker) {
+            break;
+        }
+        ++depth;
+        gain[depth] = kPieceValues[static_cast<std::size_t>(attacker_type)] - gain[depth - 1];
+        attacker_type = piece_type(attacker->second);
+        occ &= ~bit_at(attacker->first);
+        side = opposite(side);
+    }
+
+    while (depth > 0) {
+        gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
+        --depth;
+    }
+    return gain[0];
+}
+
 int move_order_score(const Position& position, const Move& move, const Move& tt_move,
                      const std::array<std::array<Move, 2>, kMaxPly>& killers,
                      const std::array<std::array<std::array<int, 64>, 64>, 2>& history,
@@ -500,24 +1178,23 @@ int move_order_score(const Position& position, const Move& move, const Move& tt_
     }
 
     int score = 0;
-    const Piece mover = position.piece_at(move.from);
     const Piece victim = captured_piece_for_move(position, move);
-    if (victim != Piece::None) {
-        score += 100'000;
+    if (move.is_capture()) {
+        const int see = see_value(position, move);
+        score += see >= 0 ? kWinningSeeBonus + see : kLosingCaptureBase + see;
         score += kPieceValues[static_cast<std::size_t>(piece_type(victim))] * 16;
-        score -= kPieceValues[static_cast<std::size_t>(piece_type(mover))];
     }
     if (move.is_promotion()) {
         score += 95'000 + kPieceValues[static_cast<std::size_t>(move.promotion)];
     }
-    if (ply < kMaxPly) {
+    if (!move.is_capture() && !move.is_promotion() && ply < kMaxPly) {
         if (move == killers[ply][0]) {
             score += 80'000;
         } else if (move == killers[ply][1]) {
             score += 79'000;
         }
+        score += history[static_cast<std::size_t>(position.side_to_move())][move.from][move.to];
     }
-    score += history[static_cast<std::size_t>(position.side_to_move())][move.from][move.to];
     if (move.flag == MoveFlag::KingCastle || move.flag == MoveFlag::QueenCastle) {
         score += 150;
     }
@@ -534,6 +1211,63 @@ void order_moves(const Position& position, std::vector<Move>& moves, const Move&
     });
 }
 
+void compute_time_budgets(const Position& root, const SearchLimits& limits, const EngineOptions& options,
+                          int& soft_time_ms, int& hard_time_ms) {
+    soft_time_ms = 0;
+    hard_time_ms = 0;
+    if (limits.infinite) {
+        return;
+    }
+
+    const int overhead = std::max(0, options.move_overhead_ms);
+    if (limits.time_limit_ms > 0) {
+        const int available = std::max(1, limits.time_limit_ms - overhead);
+        soft_time_ms = available;
+        hard_time_ms = available;
+        return;
+    }
+
+    const bool white = root.side_to_move() == Color::White;
+    const int clock = white ? limits.white_time_ms : limits.black_time_ms;
+    const int increment = white ? limits.white_increment_ms : limits.black_increment_ms;
+    if (clock <= 0) {
+        return;
+    }
+
+    const int available = std::max(1, clock - overhead);
+    const int moves_to_go = std::max(1, limits.moves_to_go > 0 ? limits.moves_to_go : 30);
+    const int base = available / moves_to_go;
+    const int increment_share = increment * 3 / 4;
+    soft_time_ms = std::clamp(base + increment_share, 1, available);
+    hard_time_ms = std::clamp(std::max(soft_time_ms + 25, soft_time_ms + soft_time_ms / 3), soft_time_ms, available);
+}
+
+bool is_quiet_move(const Move& move) {
+    return !move.is_capture() && !move.is_promotion();
+}
+
+bool is_zugzwang_prone(const Position& position) {
+    return !position.has_non_pawn_material(position.side_to_move()) || position.piece_count() <= 6;
+}
+
+void update_quiet_cutoff_stats(SearchContext& context, Color color, const Move& best_move,
+                               const std::vector<Move>& quiets_tried, int depth, int ply) {
+    if (ply >= kMaxPly) {
+        return;
+    }
+    if (context.killers[ply][0] != best_move) {
+        context.killers[ply][1] = context.killers[ply][0];
+        context.killers[ply][0] = best_move;
+    }
+
+    update_history_value(context.history[static_cast<std::size_t>(color)][best_move.from][best_move.to], move_history_bonus(depth));
+    for (const Move& quiet : quiets_tried) {
+        if (quiet != best_move) {
+            update_history_value(context.history[static_cast<std::size_t>(color)][quiet.from][quiet.to], move_history_penalty(depth));
+        }
+    }
+}
+
 SearchNodeResult quiescence(Position& position, SearchContext& context, int alpha, int beta, int ply) {
     if (should_stop(context)) {
         return node_result(0, false);
@@ -543,6 +1277,11 @@ SearchNodeResult quiescence(Position& position, SearchContext& context, int alph
     if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
         return node_result(0, true);
     }
+#ifdef DEADFISH_WITH_SYZYGY
+    if (const auto tb_score = probe_tablebase_wdl(position, *context.state)) {
+        return node_result(*tb_score, true);
+    }
+#endif
 
     int stand_pat = position.evaluate_relative();
     if (stand_pat >= beta) {
@@ -566,6 +1305,10 @@ SearchNodeResult quiescence(Position& position, SearchContext& context, int alph
 
     SearchNodeResult best = node_result(alpha, true);
     for (const Move& move : moves) {
+        if (!position.in_check(position.side_to_move()) && move.is_capture() && !move.is_promotion() &&
+            see_value(position, move) < 0) {
+            continue;
+        }
         UndoState undo;
         if (!position.make_move(move, undo)) {
             continue;
@@ -594,7 +1337,8 @@ SearchNodeResult quiescence(Position& position, SearchContext& context, int alph
     return best;
 }
 
-SearchNodeResult negamax(Position& position, SearchContext& context, int depth, int alpha, int beta, int ply) {
+SearchNodeResult negamax(Position& position, SearchContext& context, int depth, int alpha, int beta, int ply,
+                         bool pv_node, bool allow_null) {
     if (should_stop(context)) {
         return node_result(0, false);
     }
@@ -603,33 +1347,58 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
     const std::uint64_t hash = position.hash();
     Move tt_move = Move::null();
 
-    auto tt_it = context.tt.find(hash);
-    if (tt_it != context.tt.end() && tt_it->second.depth >= depth) {
-        tt_move = tt_it->second.best_move;
-        if (tt_it->second.flag == TTFlag::Exact) {
-            return {.score = tt_it->second.score, .best_move = tt_it->second.best_move, .pv = {tt_it->second.best_move}, .completed = true};
-        }
-        if (tt_it->second.flag == TTFlag::Lower) {
-            alpha = std::max(alpha, tt_it->second.score);
-        } else if (tt_it->second.flag == TTFlag::Upper) {
-            beta = std::min(beta, tt_it->second.score);
-        }
-        if (alpha >= beta) {
-            return {.score = tt_it->second.score, .best_move = tt_it->second.best_move, .pv = {tt_it->second.best_move}, .completed = true};
+    if (const auto tt_entry = context.state->tt.probe(hash, ply)) {
+        tt_move = tt_entry->best_move;
+        if (tt_entry->depth >= depth) {
+            if (tt_entry->flag == TTFlag::Exact) {
+                return node_result(tt_entry->score, true, tt_entry->best_move, {tt_entry->best_move});
+            }
+            if (tt_entry->flag == TTFlag::Lower) {
+                alpha = std::max(alpha, tt_entry->score);
+            } else if (tt_entry->flag == TTFlag::Upper) {
+                beta = std::min(beta, tt_entry->score);
+            }
+            if (alpha >= beta) {
+                return node_result(tt_entry->score, true, tt_entry->best_move, {tt_entry->best_move});
+            }
         }
     }
 
     if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
         return node_result(0, true);
     }
+#ifdef DEADFISH_WITH_SYZYGY
+    if (const auto tb_score = probe_tablebase_wdl(position, *context.state)) {
+        return node_result(*tb_score, true);
+    }
+#endif
     if (depth <= 0) {
         return quiescence(position, context, alpha, beta, ply);
+    }
+    if (ply >= kMaxPly - 2) {
+        return node_result(position.evaluate_relative(), true);
+    }
+
+    const bool in_check = position.in_check(position.side_to_move());
+    if (!pv_node && allow_null && depth >= 3 && !in_check && !is_zugzwang_prone(position)) {
+        UndoState undo;
+        if (position.make_null_move(undo)) {
+            const int reduction = depth >= 6 ? 3 : 2;
+            SearchNodeResult child = negamax(position, context, depth - 1 - reduction, -beta, -beta + 1, ply + 1, false, false);
+            position.unmake_move(undo);
+            if (!child.completed) {
+                return node_result(0, false);
+            }
+            if (-child.score >= beta) {
+                return node_result(beta, true);
+            }
+        }
     }
 
     context.nodes += 1;
     std::vector<Move> moves = position.legal_moves_fast(false);
     if (moves.empty()) {
-        if (position.in_check(position.side_to_move())) {
+        if (in_check) {
             return node_result(-kMateScore + ply, true);
         }
         return node_result(0, true);
@@ -638,12 +1407,49 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
     order_moves(position, moves, tt_move, context.killers, context.history, ply);
 
     SearchNodeResult best = node_result(-kInfinity, true);
+    std::vector<Move> quiets_tried;
+    int move_index = 0;
+    const Color us = position.side_to_move();
     for (const Move& move : moves) {
-        UndoState undo;
-        if (!position.make_move(move, undo)) {
+        if (!pv_node && depth >= 3 && !in_check && move.is_capture() && !move.is_promotion() &&
+            see_value(position, move) < 0) {
+            ++move_index;
             continue;
         }
-        SearchNodeResult child = negamax(position, context, depth - 1, -beta, -alpha, ply + 1);
+
+        UndoState undo;
+        if (!position.make_move(move, undo)) {
+            ++move_index;
+            continue;
+        }
+
+        const bool quiet = is_quiet_move(move);
+        int reduction = 0;
+        if (!pv_node && quiet && depth >= 3 && move_index >= 3) {
+            reduction = 1;
+            if (depth >= 6 && move_index >= 6) {
+                reduction += 1;
+            }
+        }
+
+        SearchNodeResult child;
+        if (move_index == 0) {
+            child = negamax(position, context, depth - 1, -beta, -alpha, ply + 1, pv_node, true);
+        } else {
+            child = negamax(position, context, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, false, true);
+            if (child.completed) {
+                const int reduced_score = -child.score;
+                if (reduction > 0 && reduced_score > alpha) {
+                    child = negamax(position, context, depth - 1, -alpha - 1, -alpha, ply + 1, false, true);
+                }
+                if (child.completed) {
+                    const int pvs_score = -child.score;
+                    if (pvs_score > alpha && pvs_score < beta) {
+                        child = negamax(position, context, depth - 1, -beta, -alpha, ply + 1, true, true);
+                    }
+                }
+            }
+        }
         position.unmake_move(undo);
         if (!child.completed) {
             return node_result(0, false);
@@ -656,36 +1462,29 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
             best.pv = child.pv;
             best.pv.insert(best.pv.begin(), move);
         }
+        if (quiet) {
+            quiets_tried.push_back(move);
+        }
 
         alpha = std::max(alpha, score);
         if (alpha >= beta) {
-            if (!move.is_capture() && ply < kMaxPly) {
-                if (context.killers[ply][0] != move) {
-                    context.killers[ply][1] = context.killers[ply][0];
-                    context.killers[ply][0] = move;
-                }
-                context.history[static_cast<std::size_t>(position.side_to_move())][move.from][move.to] += move_history_bonus(depth);
+            if (quiet) {
+                update_quiet_cutoff_stats(context, us, move, quiets_tried, depth, ply);
             }
             break;
         }
+
+        ++move_index;
     }
 
     if (!context.stop && !best.best_move.is_null()) {
-        TTEntry entry;
-        entry.depth = depth;
-        entry.score = best.score;
-        entry.best_move = best.best_move;
+        TTFlag flag = TTFlag::Exact;
         if (best.score <= alpha_original) {
-            entry.flag = TTFlag::Upper;
+            flag = TTFlag::Upper;
         } else if (best.score >= beta) {
-            entry.flag = TTFlag::Lower;
-        } else {
-            entry.flag = TTFlag::Exact;
+            flag = TTFlag::Lower;
         }
-        if (context.tt.size() > 250000) {
-            context.tt.clear();
-        }
-        context.tt[hash] = entry;
+        context.state->tt.store(hash, depth, best.score, flag, best.best_move, ply);
     }
 
     return best;
@@ -711,22 +1510,111 @@ std::uint64_t perft_recursive(Position& position, int depth) {
 
 }  // namespace
 
-Engine::Engine() = default;
+Engine::Engine() : state_(std::make_unique<EngineState>()) {
+    state_->tt.resize_mb(state_->options.hash_mb);
+}
+
+Engine::~Engine() = default;
+
+Engine::Engine(Engine&&) noexcept = default;
+
+Engine& Engine::operator=(Engine&&) noexcept = default;
+
+const EngineOptions& Engine::options() const {
+    return state_->options;
+}
+
+void Engine::set_options(const EngineOptions& incoming) {
+    EngineOptions updated = incoming;
+    updated.hash_mb = std::max(1, updated.hash_mb);
+    updated.syzygy_probe_limit = std::clamp(updated.syzygy_probe_limit, 0, 7);
+    updated.move_overhead_ms = std::max(0, updated.move_overhead_ms);
+
+    const bool resize_hash = updated.hash_mb != state_->options.hash_mb;
+    const bool reset_book = updated.book_path != state_->options.book_path || updated.own_book != state_->options.own_book;
+    state_->options = std::move(updated);
+
+    if (resize_hash) {
+        state_->tt.resize_mb(state_->options.hash_mb);
+    }
+    if (reset_book) {
+        clear_book_cache(*state_);
+    }
+}
+
+void Engine::reset_search_state() {
+    state_->stop_requested.store(false, std::memory_order_relaxed);
+    state_->tt.clear();
+}
+
+void Engine::request_stop() {
+    state_->stop_requested.store(true, std::memory_order_relaxed);
+}
+
+void Engine::clear_stop_request() {
+    state_->stop_requested.store(false, std::memory_order_relaxed);
+}
 
 SearchResult Engine::search(const Position& root, const SearchLimits& limits, SearchCallback callback) {
+    clear_stop_request();
+    SearchResult result;
+    result.best_move = Move::null();
+    result.completed = true;
+
+    if (!root.is_draw()) {
+        if (Move book_move = probe_book_move(root, *state_); !book_move.is_null()) {
+            result.best_move = book_move;
+            result.pv = {book_move};
+            result.used_book = true;
+            return result;
+        }
+#ifdef DEADFISH_WITH_SYZYGY
+        if (TablebaseRootResult tablebase = probe_tablebase_root(root, *state_); tablebase.ok) {
+            result.best_move = tablebase.move;
+            result.score = tablebase.score;
+            result.pv = {tablebase.move};
+            result.used_tablebase = true;
+            return result;
+        }
+#endif
+    }
+
     SearchContext context;
+    context.state = state_.get();
     context.limits = limits;
     context.callback = std::move(callback);
     context.start_time = std::chrono::steady_clock::now();
-    context.tt.reserve(131072);
+    compute_time_budgets(root, limits, state_->options, context.soft_time_ms, context.hard_time_ms);
+    state_->tt.new_search();
 
     Position position = root;
-    SearchResult result;
-    result.best_move = Move::null();
-
-    const int max_depth = std::max(1, limits.max_depth);
+    const int default_depth = limits.infinite ? (kMaxPly - 1) : 64;
+    const int max_depth = std::max(1, limits.max_depth > 0 ? limits.max_depth : default_depth);
+    int previous_score = 0;
     for (int depth = 1; depth <= max_depth; ++depth) {
-        SearchNodeResult node = negamax(position, context, depth, -kInfinity, kInfinity, 0);
+        SearchNodeResult node;
+        if (depth >= 4 && result.completed) {
+            int window = kDefaultAspirationWindow;
+            while (true) {
+                const int aspiration_alpha = std::max(-kInfinity, previous_score - window);
+                const int aspiration_beta = std::min(kInfinity, previous_score + window);
+                node = negamax(position, context, depth, aspiration_alpha, aspiration_beta, 0, true, true);
+                if (!node.completed) {
+                    break;
+                }
+                if (node.score <= aspiration_alpha || node.score >= aspiration_beta) {
+                    window *= 2;
+                    if (window > kInfinity / 2) {
+                        node = negamax(position, context, depth, -kInfinity, kInfinity, 0, true, true);
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        } else {
+            node = negamax(position, context, depth, -kInfinity, kInfinity, 0, true, true);
+        }
         if (!node.completed) {
             result.timed_out = context.stop;
             break;
@@ -737,10 +1625,10 @@ SearchResult Engine::search(const Position& root, const SearchLimits& limits, Se
             result.depth_reached = depth;
             result.pv = node.pv;
             result.completed = true;
+            previous_score = node.score;
         }
 
-        const int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - context.start_time).count());
+        const int elapsed = elapsed_ms(context);
         const std::uint64_t nps = elapsed > 0 ? (context.nodes * 1000ULL) / static_cast<std::uint64_t>(elapsed) : context.nodes;
         if (context.callback) {
             context.callback(SearchInfo{
@@ -755,16 +1643,22 @@ SearchResult Engine::search(const Position& root, const SearchLimits& limits, Se
         if (std::abs(result.score) >= kMateScore - 128) {
             break;
         }
-        if (context.stop) {
+        if (context.stop || soft_limit_reached(context)) {
             result.timed_out = true;
             break;
         }
     }
 
-    result.elapsed_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - context.start_time).count());
+    result.elapsed_ms = elapsed_ms(context);
     result.nodes = context.nodes;
     result.nps = result.elapsed_ms > 0 ? (context.nodes * 1000ULL) / static_cast<std::uint64_t>(result.elapsed_ms) : context.nodes;
+    if (result.best_move.is_null()) {
+        std::vector<Move> legal = root.legal_moves();
+        if (!legal.empty()) {
+            result.best_move = legal.front();
+            result.pv = {result.best_move};
+        }
+    }
     return result;
 }
 
@@ -820,6 +1714,10 @@ std::string join_moves(const std::vector<Move>& moves, const std::string& delimi
     return out.str();
 }
 
+int static_exchange_eval(const Position& position, const Move& move) {
+    return see_value(position, move);
+}
+
 }  // namespace deadfish
 
 namespace deadfish {
@@ -841,6 +1739,9 @@ bool Move::is_promotion() const {
 }
 
 std::string Move::to_uci() const {
+    if (is_null()) {
+        return "0000";
+    }
     std::string text = square_to_string(from) + square_to_string(to);
     if (promotion != PieceType::None) {
         text += promotion_to_char(promotion);
@@ -1091,6 +1992,37 @@ const std::array<Piece, 64>& Position::board() const {
 
 Piece Position::piece_at(int square) const {
     return square >= 0 && square < 64 ? board_[square] : Piece::None;
+}
+
+Bitboard Position::occupancy() const {
+    return color_bitboards_[static_cast<std::size_t>(Color::White)] |
+           color_bitboards_[static_cast<std::size_t>(Color::Black)];
+}
+
+Bitboard Position::occupancy(Color color) const {
+    return color_bitboards_[static_cast<std::size_t>(color)];
+}
+
+Bitboard Position::piece_bitboard(Piece piece) const {
+    return piece_bitboards_[static_cast<std::size_t>(piece)];
+}
+
+int Position::piece_count() const {
+    return static_cast<int>(std::popcount(occupancy()));
+}
+
+bool Position::has_non_pawn_material(Color color) const {
+    for (int square = 0; square < 64; ++square) {
+        const Piece piece = board_[square];
+        if (piece == Piece::None || piece_color(piece) != color) {
+            continue;
+        }
+        const PieceType type = piece_type(piece);
+        if (type != PieceType::King && type != PieceType::Pawn) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Position::clear() {
@@ -1553,6 +2485,33 @@ bool Position::make_move(const Move& move, UndoState& undo) {
     }
 
     side_to_move_ = them;
+    hash_ = compute_hash();
+    repetition_history_.push_back(hash_);
+    return true;
+}
+
+bool Position::make_null_move(UndoState& undo) {
+    undo.board = board_;
+    undo.piece_bitboards = piece_bitboards_;
+    undo.color_bitboards = color_bitboards_;
+    undo.side_to_move = side_to_move_;
+    undo.castling_rights = castling_rights_;
+    undo.en_passant_square = en_passant_square_;
+    undo.halfmove_clock = halfmove_clock_;
+    undo.fullmove_number = fullmove_number_;
+    undo.hash = hash_;
+    undo.repetition_size = repetition_history_.size();
+
+    if (in_check(side_to_move_)) {
+        return false;
+    }
+
+    en_passant_square_ = kNoSquare;
+    halfmove_clock_ += 1;
+    if (side_to_move_ == Color::Black) {
+        fullmove_number_ += 1;
+    }
+    side_to_move_ = opposite(side_to_move_);
     hash_ = compute_hash();
     repetition_history_.push_back(hash_);
     return true;

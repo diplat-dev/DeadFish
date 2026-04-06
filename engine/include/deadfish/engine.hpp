@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,6 +73,12 @@ struct Move {
 struct SearchLimits {
     int max_depth = 5;
     int time_limit_ms = 0;
+    int white_time_ms = 0;
+    int black_time_ms = 0;
+    int white_increment_ms = 0;
+    int black_increment_ms = 0;
+    int moves_to_go = 0;
+    bool infinite = false;
 };
 
 struct SearchInfo {
@@ -81,6 +88,15 @@ struct SearchInfo {
     std::uint64_t nps = 0;
     int elapsed_ms = 0;
     std::vector<Move> pv;
+};
+
+struct EngineOptions {
+    int hash_mb = 32;
+    bool own_book = true;
+    std::string book_path;
+    std::string syzygy_path;
+    int syzygy_probe_limit = 6;
+    int move_overhead_ms = 20;
 };
 
 struct SearchResult {
@@ -93,6 +109,8 @@ struct SearchResult {
     std::vector<Move> pv;
     bool completed = false;
     bool timed_out = false;
+    bool used_book = false;
+    bool used_tablebase = false;
 };
 
 struct UndoState {
@@ -136,6 +154,7 @@ public:
     bool is_move_legal(const Move& move) const;
     bool apply_uci_move(const std::string& uci, std::string* error = nullptr);
     bool make_move(const Move& move, UndoState& undo);
+    bool make_null_move(UndoState& undo);
     void unmake_move(const UndoState& undo);
 
     bool is_square_attacked(int square, Color by_color) const;
@@ -149,6 +168,11 @@ public:
 
     int evaluate_absolute() const;
     int evaluate_relative() const;
+    Bitboard occupancy() const;
+    Bitboard occupancy(Color color) const;
+    Bitboard piece_bitboard(Piece piece) const;
+    int piece_count() const;
+    bool has_non_pawn_material(Color color) const;
 
 private:
     struct RawInitTag {};
@@ -177,18 +201,35 @@ private:
 
 using SearchCallback = std::function<void(const SearchInfo&)>;
 
+struct EngineState;
+
 class Engine {
 public:
     Engine();
+    ~Engine();
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+    Engine(Engine&&) noexcept;
+    Engine& operator=(Engine&&) noexcept;
+
+    const EngineOptions& options() const;
+    void set_options(const EngineOptions& options);
+    void reset_search_state();
+    void request_stop();
+    void clear_stop_request();
 
     SearchResult search(const Position& root, const SearchLimits& limits, SearchCallback callback = {});
     std::uint64_t perft(const Position& root, int depth);
     std::vector<std::pair<Move, std::uint64_t>> divide(const Position& root, int depth);
 
     static std::vector<std::string> benchmark_positions();
+
+private:
+    std::unique_ptr<EngineState> state_;
 };
 
 std::string score_to_string(int score);
 std::string join_moves(const std::vector<Move>& moves, const std::string& delimiter = " ");
+int static_exchange_eval(const Position& position, const Move& move);
 
 }  // namespace deadfish

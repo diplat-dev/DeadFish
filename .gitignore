@@ -10,6 +10,7 @@ web/deadfish_wasm.wasm
 
 __pycache__/
 *.pyc
+.tmp_pydeps/
 
 tools/emsdk/
 .emscripten

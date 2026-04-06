@@ -8,6 +8,7 @@
 namespace {
 
 using deadfish::Engine;
+using deadfish::EngineOptions;
 using deadfish::Position;
 using deadfish::SearchLimits;
 using deadfish::SearchResult;
@@ -34,6 +35,16 @@ bool contains_move(const Position& position, const std::string& uci) {
         }
     }
     return false;
+}
+
+Engine make_search_engine() {
+    Engine engine;
+    EngineOptions options = engine.options();
+    options.own_book = false;
+    options.book_path.clear();
+    options.syzygy_path.clear();
+    engine.set_options(options);
+    return engine;
 }
 
 void test_fen_round_trip(TestContext& t) {
@@ -69,6 +80,17 @@ void test_make_unmake(TestContext& t) {
     }
 }
 
+void test_null_move_unmake(TestContext& t) {
+    Position position = Position::from_fen("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2");
+    const std::string original_fen = position.to_fen();
+    const std::uint64_t original_hash = position.hash();
+    deadfish::UndoState undo;
+    t.expect(position.make_null_move(undo), "null move succeeds outside check");
+    position.unmake_move(undo);
+    t.expect(position.to_fen() == original_fen, "null move restores FEN");
+    t.expect(position.hash() == original_hash, "null move restores hash");
+}
+
 void test_special_moves(TestContext& t) {
     Position castling = Position::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
     t.expect(contains_move(castling, "e1g1"), "white king-side castling generated");
@@ -93,10 +115,25 @@ void test_game_states(TestContext& t) {
 
     Position insufficient = Position::from_fen("8/8/8/8/8/8/5k2/6K1 w - - 0 1");
     t.expect(insufficient.is_insufficient_material(), "insufficient material detected");
+
+    Position fifty = Position::from_fen("8/8/8/8/8/8/5k2/6K1 w - - 100 75");
+    t.expect(fifty.is_draw_by_fifty_move(), "fifty-move draw detected");
+
+    Position repetition = Position::start_position();
+    std::string error;
+    for (const std::string& move : {"g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8"}) {
+        t.expect(repetition.apply_uci_move(move, &error), "repetition move applied: " + move);
+        t.expect(error.empty(), "repetition move valid: " + move);
+    }
+    t.expect(repetition.is_draw_by_repetition(), "repetition draw detected");
 }
 
 void test_perft(TestContext& t) {
     Engine engine;
+    EngineOptions options = engine.options();
+    options.own_book = false;
+    engine.set_options(options);
+
     struct Case {
         std::string fen;
         int depth;
@@ -121,8 +158,27 @@ void test_perft(TestContext& t) {
     }
 }
 
+void test_see(TestContext& t) {
+    {
+        Position position = Position::from_fen("4k3/8/8/8/3r4/4Q3/8/4K3 w - - 0 1");
+        deadfish::Move move = position.parse_uci_move("e3d4");
+        t.expect(deadfish::static_exchange_eval(position, move) > 0, "SEE winning capture is positive");
+    }
+    {
+        Position position = Position::from_fen("4k3/8/8/4p3/3r4/3R4/8/4K3 w - - 0 1");
+        deadfish::Move move = position.parse_uci_move("d3d4");
+        t.expect(deadfish::static_exchange_eval(position, move) == 0, "SEE equal exchange is zero");
+    }
+    {
+        Position position = Position::from_fen("4r1k1/8/8/4p3/8/8/4Q3/4K3 w - - 0 1");
+        deadfish::Move move = position.parse_uci_move("e2e5");
+        t.expect(deadfish::static_exchange_eval(position, move) < 0, "SEE losing capture is negative");
+    }
+}
+
 void test_search(TestContext& t) {
-    Engine engine;
+    Engine engine = make_search_engine();
+
     Position mate_in_one = Position::from_fen("7k/6Q1/6K1/8/8/8/8/8 w - - 0 1");
     SearchLimits mate_limits;
     mate_limits.max_depth = 3;
@@ -136,6 +192,60 @@ void test_search(TestContext& t) {
     SearchResult timed_result = engine.search(start, timed);
     t.expect(!timed_result.best_move.is_null(), "time-limited search returns a move");
     t.expect(start.is_move_legal(timed_result.best_move), "time-limited search move is legal");
+
+    SearchLimits clocked;
+    clocked.max_depth = 8;
+    clocked.white_time_ms = 100;
+    clocked.black_time_ms = 100;
+    clocked.white_increment_ms = 10;
+    clocked.black_increment_ms = 10;
+    clocked.moves_to_go = 10;
+    SearchResult clocked_result = engine.search(start, clocked);
+    t.expect(!clocked_result.best_move.is_null(), "clock-based search returns a move");
+    t.expect(start.is_move_legal(clocked_result.best_move), "clock-based search move is legal");
+}
+
+void test_book_and_tablebase_fallbacks(TestContext& t) {
+    Position start = Position::start_position();
+    SearchLimits limits;
+    limits.max_depth = 1;
+
+    {
+        Engine engine;
+        SearchResult result = engine.search(start, limits);
+        t.expect(result.used_book, "default book is used from the start position");
+        t.expect(start.is_move_legal(result.best_move), "book move is legal");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        SearchResult result = engine.search(start, limits);
+        t.expect(!result.used_book, "book can be disabled");
+        t.expect(start.is_move_legal(result.best_move), "search move is legal when book is disabled");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.own_book = true;
+        options.book_path = "Z:/deadfish-missing/book.bin";
+        engine.set_options(options);
+        SearchResult result = engine.search(start, limits);
+        t.expect(!result.used_book, "missing book falls back cleanly");
+        t.expect(start.is_move_legal(result.best_move), "fallback move is legal when book path is invalid");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.syzygy_path = "Z:/deadfish-missing/syzygy";
+        options.syzygy_probe_limit = 6;
+        engine.set_options(options);
+        Position kqk = Position::from_fen("6k1/8/8/8/8/8/6K1/7Q w - - 0 1");
+        SearchResult result = engine.search(kqk, limits);
+        t.expect(!result.used_tablebase, "missing syzygy path falls back cleanly");
+        t.expect(kqk.is_move_legal(result.best_move), "fallback move is legal when syzygy path is invalid");
+    }
 }
 
 }  // namespace
@@ -144,10 +254,13 @@ int main() {
     TestContext t;
     test_fen_round_trip(t);
     test_make_unmake(t);
+    test_null_move_unmake(t);
     test_special_moves(t);
     test_game_states(t);
     test_perft(t);
+    test_see(t);
     test_search(t);
+    test_book_and_tablebase_fallbacks(t);
 
     std::cout << "\nPassed: " << t.passed << "\n";
     std::cout << "Failed: " << t.failed << "\n";

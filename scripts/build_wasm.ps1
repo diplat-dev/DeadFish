@@ -5,9 +5,37 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $webDir = Join-Path $root "web"
 $includeDir = Join-Path $root "engine\include"
-$localEmpp = Join-Path $root "tools\emsdk\upstream\emscripten\em++.bat"
+$localEmsdk = Join-Path $root "tools\emsdk"
+$localEmpp = Join-Path $localEmsdk "upstream\emscripten\em++.bat"
+$localConfig = Join-Path $localEmsdk ".emscripten"
 
 $empp = if (Test-Path $localEmpp) {
+    if (Test-Path $localConfig) {
+        $env:EMSDK = $localEmsdk
+        $env:EM_CONFIG = $localConfig
+
+        $nodeDir = Get-ChildItem -Path (Join-Path $localEmsdk "node") -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+        $pythonDir = Get-ChildItem -Path (Join-Path $localEmsdk "python") -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($nodeDir) {
+            $env:EMSDK_NODE = Join-Path $nodeDir.FullName "bin\node.exe"
+        }
+        if ($pythonDir) {
+            $env:EMSDK_PYTHON = Join-Path $pythonDir.FullName "python.exe"
+        }
+
+        $pathEntries = @(
+            $localEmsdk,
+            (Join-Path $localEmsdk "upstream\emscripten"),
+            (Join-Path $localEmsdk "upstream\bin")
+        )
+        if ($nodeDir) {
+            $pathEntries += (Join-Path $nodeDir.FullName "bin")
+        }
+        if ($pythonDir) {
+            $pathEntries += $pythonDir.FullName
+        }
+        $env:PATH = (($pathEntries | Where-Object { $_ }) -join ";") + ";" + $env:PATH
+    }
     $localEmpp
 } else {
     $command = Get-Command em++ -ErrorAction SilentlyContinue
