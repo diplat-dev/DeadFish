@@ -1,6 +1,9 @@
 param(
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+
+    [ValidateSet("Generic", "Native", "All")]
+    [string]$Target = "Generic"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +28,7 @@ if (-not $clang) {
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
-$common = @(
+$baseFlags = @(
     "-std=c++20",
     "-I", $includeDir,
     "-Wall",
@@ -33,7 +36,7 @@ $common = @(
 )
 
 if (Test-Path $fathomDir) {
-    $common += @(
+    $baseFlags += @(
         "-DDEADFISH_WITH_SYZYGY=1",
         "-D_CRT_SECURE_NO_WARNINGS",
         "-D_SILENCE_CXX20_ATOMIC_INIT_DEPRECATION_WARNING",
@@ -43,33 +46,49 @@ if (Test-Path $fathomDir) {
 }
 
 if ($Configuration -eq "Debug") {
-    $common += @("-O0", "-g")
+    $baseFlags += @("-O0", "-g")
 } else {
-    $common += @("-O2")
+    $baseFlags += @("-O2")
 }
 
-$nativeSources = @(
-    (Join-Path $root "cli\main.cpp"),
+$sources = @(
     (Join-Path $root "engine\src\engine.cpp")
 )
 if (Test-Path $fathomDir) {
-    $nativeSources += @("-x", "c++", (Join-Path $fathomDir "tbprobe.c"))
+    $sources += @("-x", "c++", (Join-Path $fathomDir "tbprobe.c"))
 }
 
-& $clang @common @nativeSources "-o" (Join-Path $buildDir "deadfish.exe")
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+function Build-DeadFishTarget {
+    param(
+        [string]$Name,
+        [string[]]$ExtraFlags,
+        [string]$Suffix
+    )
 
-$testSources = @(
-    (Join-Path $root "tests\main.cpp"),
-    (Join-Path $root "engine\src\engine.cpp")
-)
-if (Test-Path $fathomDir) {
-    $testSources += @("-x", "c++", (Join-Path $fathomDir "tbprobe.c"))
+    $flags = @($baseFlags + $ExtraFlags)
+    $engineOutput = Join-Path $buildDir ("deadfish{0}.exe" -f $Suffix)
+    $testsOutput = Join-Path $buildDir ("deadfish_tests{0}.exe" -f $Suffix)
+
+    & $clang @flags (Join-Path $root "cli\main.cpp") @sources "-o" $engineOutput
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    & $clang @flags (Join-Path $root "tests\main.cpp") @sources "-o" $testsOutput
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    Write-Host "Built ${Name}:"
+    Write-Host "  $engineOutput"
+    Write-Host "  $testsOutput"
 }
 
-& $clang @common @testSources "-o" (Join-Path $buildDir "deadfish_tests.exe")
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-Write-Host "Built:"
-Write-Host "  $buildDir\deadfish.exe"
-Write-Host "  $buildDir\deadfish_tests.exe"
+switch ($Target) {
+    "Generic" {
+        Build-DeadFishTarget -Name "generic" -ExtraFlags @() -Suffix ""
+    }
+    "Native" {
+        Build-DeadFishTarget -Name "native" -ExtraFlags @("-O3", "-march=native", "-mtune=native", "-mpopcnt") -Suffix "_native"
+    }
+    "All" {
+        Build-DeadFishTarget -Name "generic" -ExtraFlags @() -Suffix ""
+        Build-DeadFishTarget -Name "native" -ExtraFlags @("-O3", "-march=native", "-mtune=native", "-mpopcnt") -Suffix "_native"
+    }
+}

@@ -114,16 +114,18 @@ struct SearchResult {
 };
 
 struct UndoState {
-    std::array<Piece, 64> board{};
-    std::array<Bitboard, 13> piece_bitboards{};
-    std::array<Bitboard, 2> color_bitboards{};
+    Move move = Move::null();
+    Piece moved_piece = Piece::None;
+    Piece captured_piece = Piece::None;
     Color side_to_move = Color::White;
+    int captured_square = -1;
     std::uint8_t castling_rights = 0;
     int en_passant_square = -1;
     int halfmove_clock = 0;
     int fullmove_number = 1;
     std::uint64_t hash = 0;
     std::size_t repetition_size = 0;
+    bool was_null_move = false;
 };
 
 class Position {
@@ -190,11 +192,14 @@ private:
 
     explicit Position(RawInitTag);
     void clear();
-    void place_piece(int square, Piece piece);
-    void remove_piece(int square);
-    void move_piece(int from, int to);
+    void place_piece(int square, Piece piece, bool update_hash = false);
+    void remove_piece(int square, bool update_hash = false);
+    void move_piece(int from, int to, bool update_hash = false);
     void refresh_color_bitboards();
     std::uint64_t compute_hash() const;
+    void xor_castling_hash(std::uint8_t castling_rights);
+    void xor_en_passant_hash(int en_passant_square);
+    void xor_side_hash();
     int king_square(Color color) const;
     std::vector<Move> generate_pseudo_moves(bool captures_only) const;
 };

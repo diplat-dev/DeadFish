@@ -42,7 +42,7 @@ def main() -> int:
     try:
         engine.send("uci")
         lines = engine.read_until(lambda line, _: line == "uciok")
-        for option in ("Hash", "OwnBook", "BookPath", "SyzygyPath", "SyzygyProbeLimit", "MoveOverhead"):
+        for option in ("Hash", "Clear Hash", "OwnBook", "BookPath", "SyzygyPath", "SyzygyProbeLimit", "MoveOverhead"):
             expect(any(f"option name {option} " in line for line in lines), f"UCI advertises {option}")
         expect(any(line == "id name DeadFish" for line in lines), "UCI id name is reported")
 

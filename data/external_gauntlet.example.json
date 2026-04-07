@@ -1,0 +1,40 @@
+{
+  "cutechess": "cutechess-cli",
+  "games": 20,
+  "concurrency": 1,
+  "tc": "8+0.08",
+  "opening_file": "",
+  "opening_format": "pgn",
+  "opening_order": "random",
+  "opening_plies": 8,
+  "engine_options": [
+    "Hash=64",
+    "OwnBook=false"
+  ],
+  "opponents": [
+    {
+      "name": "Stockfish",
+      "cmd": "C:/engines/stockfish/stockfish.exe",
+      "options": [
+        "Hash=64",
+        "Threads=1"
+      ]
+    },
+    {
+      "name": "Berserk",
+      "cmd": "C:/engines/berserk/berserk.exe",
+      "options": [
+        "Hash=64",
+        "Threads=1"
+      ]
+    },
+    {
+      "name": "Ethereal",
+      "cmd": "C:/engines/ethereal/ethereal.exe",
+      "options": [
+        "Hash=64",
+        "Threads=1"
+      ]
+    }
+  ]
+}

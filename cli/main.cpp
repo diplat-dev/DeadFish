@@ -538,6 +538,7 @@ private:
         output_line("id name DeadFish");
         output_line("id author DeadFish contributors");
         output_line("option name Hash type spin default " + std::to_string(options.hash_mb) + " min 1 max 4096");
+        output_line("option name Clear Hash type button");
         output_line(std::string("option name OwnBook type check default ") + (options.own_book ? "true" : "false"));
         output_line("option name BookPath type string default <empty>");
         output_line("option name SyzygyPath type string default <empty>");

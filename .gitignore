@@ -5,12 +5,17 @@ build/
 *.ilk
 *.pdb
 
-web/deadfish_wasm.js
-web/deadfish_wasm.wasm
-
 __pycache__/
 *.pyc
 .tmp_pydeps/
+
+training/checkpoints/
+training/output/
+training/runs/
+*.nnue
+*.pt
+*.pth
+web/
 
 tools/emsdk/
 .emscripten
