@@ -585,6 +585,34 @@ struct TablebaseRootResult {
     bool ok = false;
 };
 
+constexpr int kNnueFeatureCount = 64 * 10 * 64;
+constexpr std::array<char, 8> kNnueMagic = {'D', 'F', 'N', 'N', 'U', 'E', '1', '\0'};
+
+struct NnueNetwork {
+    int feature_count = 0;
+    int accumulator_size = 0;
+    int hidden_size = 0;
+    float output_scale = 1.0f;
+    std::vector<float> feature_weights{};
+    std::vector<float> acc_bias{};
+    std::vector<float> hidden_weight{};
+    std::vector<float> hidden_bias{};
+    std::vector<float> output_weight{};
+    float output_bias = 0.0f;
+};
+
+struct NnueLoadResult {
+    std::shared_ptr<const NnueNetwork> network{};
+    std::string status{};
+    bool loaded = false;
+};
+
+struct AccumulatorFrame {
+    std::vector<float> white{};
+    std::vector<float> black{};
+    bool initialized = false;
+};
+
 }  // namespace
 
 struct EngineState {
@@ -592,6 +620,9 @@ struct EngineState {
     std::atomic<bool> stop_requested = false;
     FixedHashTable tt{};
     PolyglotBookCache book{};
+    std::shared_ptr<const NnueNetwork> nnue{};
+    std::filesystem::path nnue_loaded_path{};
+    std::string nnue_status = "NNUE unavailable; using classical eval.";
 #ifdef DEADFISH_WITH_SYZYGY
     std::mutex syzygy_mutex{};
     std::string syzygy_loaded_path{};
@@ -836,6 +867,333 @@ Move probe_book_move(const Position& position, EngineState& state) {
     return best_move;
 }
 
+std::uint32_t read_le_u32(const unsigned char* data) {
+    return static_cast<std::uint32_t>(data[0])
+        | (static_cast<std::uint32_t>(data[1]) << 8)
+        | (static_cast<std::uint32_t>(data[2]) << 16)
+        | (static_cast<std::uint32_t>(data[3]) << 24);
+}
+
+float read_le_f32(const unsigned char* data) {
+    return std::bit_cast<float>(read_le_u32(data));
+}
+
+int position_king_square(const Position& position, Color color) {
+    const Bitboard kings = position.piece_bitboard(make_piece(color, PieceType::King));
+    if (kings == 0) {
+        return kNoSquare;
+    }
+    return std::countr_zero(kings);
+}
+
+int nnue_piece_bucket(Piece piece, Color perspective) {
+    const PieceType type = piece_type(piece);
+    if (piece == Piece::None || type == PieceType::King || type == PieceType::None) {
+        return -1;
+    }
+    const int color_offset = piece_color(piece) == perspective ? 0 : 5;
+    int piece_offset = 0;
+    switch (type) {
+        case PieceType::Pawn:
+            piece_offset = 0;
+            break;
+        case PieceType::Knight:
+            piece_offset = 1;
+            break;
+        case PieceType::Bishop:
+            piece_offset = 2;
+            break;
+        case PieceType::Rook:
+            piece_offset = 3;
+            break;
+        case PieceType::Queen:
+            piece_offset = 4;
+            break;
+        case PieceType::King:
+        case PieceType::None:
+        default:
+            return -1;
+    }
+    return color_offset + piece_offset;
+}
+
+int nnue_orient_square(int square, Color perspective) {
+    return perspective == Color::White ? square : mirror_square(square);
+}
+
+std::optional<int> nnue_feature_index(const Position& position, Color perspective, Piece piece, int square) {
+    const int king_square = position_king_square(position, perspective);
+    if (king_square == kNoSquare) {
+        return std::nullopt;
+    }
+    const int bucket = nnue_piece_bucket(piece, perspective);
+    if (bucket < 0) {
+        return std::nullopt;
+    }
+    const int oriented_king = nnue_orient_square(king_square, perspective);
+    const int oriented_square = nnue_orient_square(square, perspective);
+    return oriented_king * (10 * 64) + bucket * 64 + oriented_square;
+}
+
+void ensure_accumulator_size(AccumulatorFrame& frame, int accumulator_size) {
+    if (static_cast<int>(frame.white.size()) != accumulator_size) {
+        frame.white.assign(accumulator_size, 0.0f);
+    }
+    if (static_cast<int>(frame.black.size()) != accumulator_size) {
+        frame.black.assign(accumulator_size, 0.0f);
+    }
+}
+
+void rebuild_accumulator(const Position& position, const NnueNetwork& network, Color perspective, std::vector<float>& accumulator) {
+    accumulator = network.acc_bias;
+    for (int square = 0; square < 64; ++square) {
+        const Piece piece = position.piece_at(square);
+        const auto feature = nnue_feature_index(position, perspective, piece, square);
+        if (!feature) {
+            continue;
+        }
+        const std::size_t offset = static_cast<std::size_t>(*feature) * static_cast<std::size_t>(network.accumulator_size);
+        for (int index = 0; index < network.accumulator_size; ++index) {
+            accumulator[static_cast<std::size_t>(index)] += network.feature_weights[offset + static_cast<std::size_t>(index)];
+        }
+    }
+}
+
+bool apply_feature_delta(const Position& position, const NnueNetwork& network, Color perspective,
+                         std::vector<float>& accumulator, Piece piece, int square, float sign) {
+    const auto feature = nnue_feature_index(position, perspective, piece, square);
+    if (!feature) {
+        return false;
+    }
+    const std::size_t offset = static_cast<std::size_t>(*feature) * static_cast<std::size_t>(network.accumulator_size);
+    for (int index = 0; index < network.accumulator_size; ++index) {
+        accumulator[static_cast<std::size_t>(index)] += sign * network.feature_weights[offset + static_cast<std::size_t>(index)];
+    }
+    return true;
+}
+
+void apply_move_deltas_to_accumulator(const Position& child_position, const NnueNetwork& network, Color perspective,
+                                      std::vector<float>& accumulator, const UndoState& undo) {
+    const Move& move = undo.move;
+    const Piece mover = undo.moved_piece;
+    const Color us = undo.side_to_move;
+
+    auto remove_piece_delta = [&](Piece piece, int square) {
+        if (piece != Piece::None && square != kNoSquare) {
+            apply_feature_delta(child_position, network, perspective, accumulator, piece, square, -1.0f);
+        }
+    };
+    auto add_piece_delta = [&](Piece piece, int square) {
+        if (piece != Piece::None && square != kNoSquare) {
+            apply_feature_delta(child_position, network, perspective, accumulator, piece, square, 1.0f);
+        }
+    };
+
+    if (move.flag == MoveFlag::KingCastle) {
+        remove_piece_delta(mover, move.from);
+        add_piece_delta(mover, move.to);
+        if (us == Color::White) {
+            remove_piece_delta(Piece::WRook, 7);
+            add_piece_delta(Piece::WRook, 5);
+        } else {
+            remove_piece_delta(Piece::BRook, 63);
+            add_piece_delta(Piece::BRook, 61);
+        }
+    } else if (move.flag == MoveFlag::QueenCastle) {
+        remove_piece_delta(mover, move.from);
+        add_piece_delta(mover, move.to);
+        if (us == Color::White) {
+            remove_piece_delta(Piece::WRook, 0);
+            add_piece_delta(Piece::WRook, 3);
+        } else {
+            remove_piece_delta(Piece::BRook, 56);
+            add_piece_delta(Piece::BRook, 59);
+        }
+    } else {
+        if (undo.captured_piece != Piece::None) {
+            remove_piece_delta(undo.captured_piece, undo.captured_square);
+        }
+        remove_piece_delta(mover, move.from);
+        if (move.is_promotion()) {
+            add_piece_delta(make_piece(us, move.promotion), move.to);
+        } else {
+            add_piece_delta(mover, move.to);
+        }
+    }
+}
+
+bool rebuild_search_frame(AccumulatorFrame& frame, const Position& position, const NnueNetwork& network) {
+    ensure_accumulator_size(frame, network.accumulator_size);
+    rebuild_accumulator(position, network, Color::White, frame.white);
+    rebuild_accumulator(position, network, Color::Black, frame.black);
+    frame.initialized = true;
+    return true;
+}
+
+bool update_search_frame_for_move(AccumulatorFrame& child, const AccumulatorFrame& parent, const Position& child_position,
+                                  const NnueNetwork& network, const UndoState& undo) {
+    ensure_accumulator_size(child, network.accumulator_size);
+    child.white = parent.white;
+    child.black = parent.black;
+    child.initialized = true;
+
+    const PieceType mover_type = piece_type(undo.moved_piece);
+    if (mover_type == PieceType::King) {
+        const Color us = undo.side_to_move;
+        if (us == Color::White) {
+            rebuild_accumulator(child_position, network, Color::White, child.white);
+            apply_move_deltas_to_accumulator(child_position, network, Color::Black, child.black, undo);
+        } else {
+            rebuild_accumulator(child_position, network, Color::Black, child.black);
+            apply_move_deltas_to_accumulator(child_position, network, Color::White, child.white, undo);
+        }
+        return true;
+    }
+
+    apply_move_deltas_to_accumulator(child_position, network, Color::White, child.white, undo);
+    apply_move_deltas_to_accumulator(child_position, network, Color::Black, child.black, undo);
+    return true;
+}
+
+int evaluate_with_nnue_accumulators(const Position& position, const NnueNetwork& network, const AccumulatorFrame& frame) {
+    const std::vector<float>& first = position.side_to_move() == Color::White ? frame.white : frame.black;
+    const std::vector<float>& second = position.side_to_move() == Color::White ? frame.black : frame.white;
+
+    float output = network.output_bias;
+    const int input_size = network.accumulator_size * 2;
+    for (int hidden = 0; hidden < network.hidden_size; ++hidden) {
+        float sum = network.hidden_bias[static_cast<std::size_t>(hidden)];
+        const std::size_t weight_offset = static_cast<std::size_t>(hidden) * static_cast<std::size_t>(input_size);
+        for (int index = 0; index < network.accumulator_size; ++index) {
+            sum += first[static_cast<std::size_t>(index)] * network.hidden_weight[weight_offset + static_cast<std::size_t>(index)];
+            sum += second[static_cast<std::size_t>(index)] *
+                network.hidden_weight[weight_offset + static_cast<std::size_t>(network.accumulator_size + index)];
+        }
+        const float activated = std::clamp(sum, 0.0f, 1.0f);
+        output += activated * network.output_weight[static_cast<std::size_t>(hidden)];
+    }
+    return static_cast<int>(std::lround(output * network.output_scale));
+}
+
+int evaluate_with_nnue_full(const Position& position, const NnueNetwork& network) {
+    AccumulatorFrame frame;
+    rebuild_search_frame(frame, position, network);
+    return evaluate_with_nnue_accumulators(position, network, frame);
+}
+
+NnueLoadResult load_nnue_network(const std::filesystem::path& path) {
+    NnueLoadResult result;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        result.status = "NNUE load failed: could not open " + path.string() + "; using classical eval.";
+        return result;
+    }
+
+    std::array<unsigned char, 20> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()))) {
+        result.status = "NNUE load failed: truncated header in " + path.string() + "; using classical eval.";
+        return result;
+    }
+    if (!std::equal(kNnueMagic.begin(), kNnueMagic.end(), header.begin())) {
+        result.status = "NNUE load failed: wrong magic in " + path.string() + "; using classical eval.";
+        return result;
+    }
+
+    auto network = std::make_shared<NnueNetwork>();
+    network->feature_count = static_cast<int>(read_le_u32(header.data() + 8));
+    network->accumulator_size = static_cast<int>(read_le_u32(header.data() + 12));
+    network->hidden_size = static_cast<int>(read_le_u32(header.data() + 16));
+
+    std::array<unsigned char, 4> scale_bytes{};
+    if (!input.read(reinterpret_cast<char*>(scale_bytes.data()), static_cast<std::streamsize>(scale_bytes.size()))) {
+        result.status = "NNUE load failed: missing output scale in " + path.string() + "; using classical eval.";
+        return result;
+    }
+    network->output_scale = read_le_f32(scale_bytes.data());
+
+    if (network->feature_count != kNnueFeatureCount || network->accumulator_size <= 0 || network->hidden_size <= 0 ||
+        !std::isfinite(network->output_scale) || network->output_scale <= 0.0f) {
+        result.status = "NNUE load failed: unsupported network dimensions in " + path.string() + "; using classical eval.";
+        return result;
+    }
+
+    auto read_tensor = [&](std::vector<float>& out, std::size_t count, std::string_view label) -> bool {
+        std::vector<unsigned char> buffer(count * sizeof(float));
+        if (!input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()))) {
+            result.status = "NNUE load failed: truncated " + std::string(label) + " tensor in " + path.string() +
+                "; using classical eval.";
+            return false;
+        }
+        out.resize(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            out[index] = read_le_f32(buffer.data() + index * sizeof(float));
+        }
+        return true;
+    };
+
+    const std::size_t feature_weights_count =
+        static_cast<std::size_t>(network->feature_count) * static_cast<std::size_t>(network->accumulator_size);
+    const std::size_t hidden_weight_count =
+        static_cast<std::size_t>(network->hidden_size) * static_cast<std::size_t>(network->accumulator_size * 2);
+
+    if (!read_tensor(network->feature_weights, feature_weights_count, "feature_weights") ||
+        !read_tensor(network->acc_bias, static_cast<std::size_t>(network->accumulator_size), "acc_bias") ||
+        !read_tensor(network->hidden_weight, hidden_weight_count, "hidden_weight") ||
+        !read_tensor(network->hidden_bias, static_cast<std::size_t>(network->hidden_size), "hidden_bias") ||
+        !read_tensor(network->output_weight, static_cast<std::size_t>(network->hidden_size), "output_weight")) {
+        return result;
+    }
+
+    std::vector<float> output_bias_values;
+    if (!read_tensor(output_bias_values, 1, "output_bias")) {
+        return result;
+    }
+    network->output_bias = output_bias_values.front();
+
+    std::array<char, 1> trailing{};
+    if (input.read(trailing.data(), static_cast<std::streamsize>(trailing.size()))) {
+        result.status = "NNUE load failed: trailing bytes in " + path.string() + "; using classical eval.";
+        return result;
+    }
+
+    result.network = std::move(network);
+    result.loaded = true;
+    result.status = "Loaded NNUE from " + path.string() + ".";
+    return result;
+}
+
+void refresh_nnue_runtime(EngineState& state) {
+    state.nnue.reset();
+    state.nnue_loaded_path.clear();
+
+    if (state.options.eval_file.empty()) {
+        state.nnue_status = state.options.use_nnue
+            ? "NNUE eval file not set; using classical eval."
+            : "UseNNUE=false; using classical eval.";
+        return;
+    }
+
+    const std::filesystem::path requested = normalize_path(state.options.eval_file);
+    NnueLoadResult load = load_nnue_network(requested);
+    if (!load.loaded) {
+        state.nnue_status = load.status;
+        return;
+    }
+
+    state.nnue = std::move(load.network);
+    state.nnue_loaded_path = requested;
+    state.nnue_status = state.options.use_nnue
+        ? load.status
+        : load.status + " NNUE inactive because UseNNUE=false.";
+}
+
+std::shared_ptr<const NnueNetwork> active_nnue(const EngineState& state) {
+    if (!state.options.use_nnue || !state.nnue) {
+        return nullptr;
+    }
+    return state.nnue;
+}
+
 #ifdef DEADFISH_WITH_SYZYGY
 struct TbPosition {
     std::uint64_t white = 0;
@@ -1014,6 +1372,8 @@ struct SearchContext {
     int hard_time_ms = 0;
     std::array<std::array<Move, 2>, kMaxPly> killers{};
     std::array<std::array<std::array<int, 64>, 64>, 2> history{};
+    std::shared_ptr<const NnueNetwork> nnue{};
+    std::array<AccumulatorFrame, kMaxPly + 1> nnue_frames{};
 };
 
 int elapsed_ms(const SearchContext& context) {
@@ -1034,6 +1394,37 @@ bool should_stop(SearchContext& context) {
 
 bool soft_limit_reached(const SearchContext& context) {
     return context.soft_time_ms > 0 && elapsed_ms(context) >= context.soft_time_ms;
+}
+
+bool nnue_active(const SearchContext& context) {
+    return context.nnue != nullptr;
+}
+
+void copy_null_move_frame(AccumulatorFrame& child, const AccumulatorFrame& parent, int accumulator_size) {
+    ensure_accumulator_size(child, accumulator_size);
+    child.white = parent.white;
+    child.black = parent.black;
+    child.initialized = parent.initialized;
+}
+
+bool ensure_root_nnue_frame(SearchContext& context, const Position& position) {
+    if (!nnue_active(context)) {
+        return false;
+    }
+    return rebuild_search_frame(context.nnue_frames[0], position, *context.nnue);
+}
+
+int evaluate_position(const Position& position, SearchContext& context, int ply) {
+    if (!nnue_active(context) || ply < 0 || ply > kMaxPly) {
+        return position.evaluate_relative();
+    }
+    AccumulatorFrame& frame = context.nnue_frames[static_cast<std::size_t>(ply)];
+    if (!frame.initialized) {
+        if (!rebuild_search_frame(frame, position, *context.nnue)) {
+            return position.evaluate_relative();
+        }
+    }
+    return evaluate_with_nnue_accumulators(position, *context.nnue, frame);
 }
 
 Piece captured_piece_for_move(const Position& position, const Move& move) {
@@ -1378,7 +1769,7 @@ SearchNodeResult quiescence(Position& position, SearchContext& context, int alph
     }
 #endif
 
-    int stand_pat = position.evaluate_relative();
+    int stand_pat = evaluate_position(position, context, ply);
     if (stand_pat >= beta) {
         return node_result(beta, true);
     }
@@ -1408,6 +1799,14 @@ SearchNodeResult quiescence(Position& position, SearchContext& context, int alph
         UndoState undo;
         if (!position.make_move(move, undo)) {
             continue;
+        }
+        if (nnue_active(context)) {
+            update_search_frame_for_move(
+                context.nnue_frames[static_cast<std::size_t>(ply + 1)],
+                context.nnue_frames[static_cast<std::size_t>(ply)],
+                position,
+                *context.nnue,
+                undo);
         }
         SearchNodeResult child = quiescence(position, context, -beta, -alpha, ply + 1);
         position.unmake_move(undo);
@@ -1472,13 +1871,19 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
         return quiescence(position, context, alpha, beta, ply);
     }
     if (ply >= kMaxPly - 2) {
-        return node_result(position.evaluate_relative(), true);
+        return node_result(evaluate_position(position, context, ply), true);
     }
 
     const bool in_check = position.in_check(position.side_to_move());
     if (!pv_node && allow_null && depth >= 3 && !in_check && !is_zugzwang_prone(position)) {
         UndoState undo;
         if (position.make_null_move(undo)) {
+            if (nnue_active(context)) {
+                copy_null_move_frame(
+                    context.nnue_frames[static_cast<std::size_t>(ply + 1)],
+                    context.nnue_frames[static_cast<std::size_t>(ply)],
+                    context.nnue->accumulator_size);
+            }
             const int reduction = depth >= 6 ? 3 : 2;
             SearchNodeResult child = negamax(position, context, depth - 1 - reduction, -beta, -beta + 1, ply + 1, false, false);
             position.unmake_move(undo);
@@ -1518,6 +1923,14 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
         if (!position.make_move(move, undo)) {
             ++move_index;
             continue;
+        }
+        if (nnue_active(context)) {
+            update_search_frame_for_move(
+                context.nnue_frames[static_cast<std::size_t>(ply + 1)],
+                context.nnue_frames[static_cast<std::size_t>(ply)],
+                position,
+                *context.nnue,
+                undo);
         }
 
         const bool quiet = ordered.quiet;
@@ -1609,6 +2022,7 @@ std::uint64_t perft_recursive(Position& position, int depth) {
 
 Engine::Engine() : state_(std::make_unique<EngineState>()) {
     state_->tt.resize_mb(state_->options.hash_mb);
+    refresh_nnue_runtime(*state_);
 }
 
 Engine::~Engine() = default;
@@ -1629,6 +2043,7 @@ void Engine::set_options(const EngineOptions& incoming) {
 
     const bool resize_hash = updated.hash_mb != state_->options.hash_mb;
     const bool reset_book = updated.book_path != state_->options.book_path || updated.own_book != state_->options.own_book;
+    const bool reset_nnue = updated.eval_file != state_->options.eval_file || updated.use_nnue != state_->options.use_nnue;
     state_->options = std::move(updated);
 
     if (resize_hash) {
@@ -1636,6 +2051,12 @@ void Engine::set_options(const EngineOptions& incoming) {
     }
     if (reset_book) {
         clear_book_cache(*state_);
+    }
+    if (reset_nnue) {
+        refresh_nnue_runtime(*state_);
+    }
+    if (reset_nnue && !resize_hash) {
+        state_->tt.clear();
     }
 }
 
@@ -1650,6 +2071,21 @@ void Engine::request_stop() {
 
 void Engine::clear_stop_request() {
     state_->stop_requested.store(false, std::memory_order_relaxed);
+}
+
+bool Engine::nnue_loaded() const {
+    return state_->nnue != nullptr;
+}
+
+std::string Engine::nnue_status() const {
+    return state_->nnue_status;
+}
+
+int Engine::evaluate(const Position& position) const {
+    if (std::shared_ptr<const NnueNetwork> network = active_nnue(*state_)) {
+        return evaluate_with_nnue_full(position, *network);
+    }
+    return position.evaluate_relative();
 }
 
 SearchResult Engine::search(const Position& root, const SearchLimits& limits, SearchCallback callback) {
@@ -1681,10 +2117,14 @@ SearchResult Engine::search(const Position& root, const SearchLimits& limits, Se
     context.limits = limits;
     context.callback = std::move(callback);
     context.start_time = std::chrono::steady_clock::now();
+    context.nnue = active_nnue(*state_);
     compute_time_budgets(root, limits, state_->options, context.soft_time_ms, context.hard_time_ms);
     state_->tt.new_search();
 
     Position position = root;
+    if (context.nnue) {
+        ensure_root_nnue_frame(context, position);
+    }
     const int default_depth = limits.infinite ? (kMaxPly - 1) : 64;
     const int max_depth = std::max(1, limits.max_depth > 0 ? limits.max_depth : default_depth);
     int previous_score = 0;

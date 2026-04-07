@@ -539,6 +539,8 @@ private:
         output_line("id author DeadFish contributors");
         output_line("option name Hash type spin default " + std::to_string(options.hash_mb) + " min 1 max 4096");
         output_line("option name Clear Hash type button");
+        output_line(std::string("option name UseNNUE type check default ") + (options.use_nnue ? "true" : "false"));
+        output_line("option name EvalFile type string default <empty>");
         output_line(std::string("option name OwnBook type check default ") + (options.own_book ? "true" : "false"));
         output_line("option name BookPath type string default <empty>");
         output_line("option name SyzygyPath type string default <empty>");
@@ -625,6 +627,14 @@ private:
                 return;
             }
             options.hash_mb = parsed_int;
+        } else if (iequals(name, "UseNNUE")) {
+            if (!parse_bool(value, parsed_bool)) {
+                output_line("info string invalid UseNNUE value");
+                return;
+            }
+            options.use_nnue = parsed_bool;
+        } else if (iequals(name, "EvalFile")) {
+            options.eval_file = value;
         } else if (iequals(name, "OwnBook")) {
             if (!parse_bool(value, parsed_bool)) {
                 output_line("info string invalid OwnBook value");
@@ -653,6 +663,9 @@ private:
         }
 
         engine_.set_options(options);
+        if (iequals(name, "UseNNUE") || iequals(name, "EvalFile")) {
+            output_line("info string " + engine_.nnue_status());
+        }
     }
 
     void handle_go(const std::vector<std::string>& tokens) {

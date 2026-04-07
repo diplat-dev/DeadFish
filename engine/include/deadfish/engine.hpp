@@ -92,6 +92,8 @@ struct SearchInfo {
 
 struct EngineOptions {
     int hash_mb = 32;
+    bool use_nnue = true;
+    std::string eval_file;
     bool own_book = true;
     std::string book_path;
     std::string syzygy_path;
@@ -222,6 +224,9 @@ public:
     void reset_search_state();
     void request_stop();
     void clear_stop_request();
+    bool nnue_loaded() const;
+    std::string nnue_status() const;
+    int evaluate(const Position& position) const;
 
     SearchResult search(const Position& root, const SearchLimits& limits, SearchCallback callback = {});
     std::uint64_t perft(const Position& root, int depth);

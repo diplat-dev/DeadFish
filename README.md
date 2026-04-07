@@ -9,6 +9,7 @@ The browser/WebAssembly path has been intentionally removed so the active codeba
 - Custom bitboard engine core with legal move generation, compact delta make/unmake, repetition tracking, and full Zobrist hashing
 - Iterative deepening with alpha-beta, aspiration windows, PVS, quiescence, null-move pruning, LMR, killer/history heuristics, SEE-based move handling, and a clustered fixed-size TT
 - Classical tapered evaluation with material, piece-square terms, mobility, king safety, pawn structure, passed pawns, bishop pair, rook file bonuses, simplification, and tempo
+- Engine-side float32 `DFNNUE1` inference with search-local accumulators, plus safe fallback to classical eval when no network is loaded
 - Minimal UCI support for `uci`, `isready`, `ucinewgame`, `position`, `go depth`, `go movetime`, `go wtime/btime/winc/binc/movestogo`, `go infinite`, `stop`, `quit`, and engine options
 - Bundled Polyglot opening-book support through `data/book.bin`
 - Syzygy probing through vendored [Fathom](./third_party/fathom/README.md) with external tablebase files
@@ -124,11 +125,23 @@ Implemented UCI options:
 
 - `Hash`
 - `Clear Hash`
+- `UseNNUE`
+- `EvalFile`
 - `OwnBook`
 - `BookPath`
 - `SyzygyPath`
 - `SyzygyProbeLimit`
 - `MoveOverhead`
+
+`UseNNUE` defaults to `true`, but NNUE is only active when you explicitly load a valid network through `EvalFile`. If `EvalFile` is empty, missing, unreadable, or invalid, DeadFish stays fully usable and falls back to the classical evaluator.
+
+Example:
+
+```text
+setoption name EvalFile value C:\path\to\deadfish.nnue
+setoption name UseNNUE value true
+isready
+```
 
 ## CLI Commands
 
@@ -145,7 +158,7 @@ The `status` command is useful for automation and returns JSON with side-to-move
 ## Workflow Scripts
 
 - `python .\scripts\uci_smoke.py`
-  Verifies the UCI handshake, options, depth search, movetime search, and `go infinite` / `stop`.
+  Verifies the UCI handshake, runtime options, NNUE load/unload fallback, depth search, movetime search, and `go infinite` / `stop`.
 - `python .\scripts\bench_compare.py --engine-b path\to\other\engine.exe`
   Runs the fixed native bench suite on two executables and compares time and NPS.
 - `python .\scripts\profile_bench.py --repeat 5`
@@ -176,7 +189,7 @@ The NNUE data and training flow lives under [`training/`](./training/README.md).
 - `export_nnue.py`
   Exports the checkpoint to a custom DeadFish `.nnue` binary.
 
-This training/export pipeline is ready to use independently, but the engine does not consume NNUE weights yet.
+The native engine can now load exported `DFNNUE1` networks directly through `EvalFile` and switch them on or off through `UseNNUE`.
 
 The recommended NNUE workflow is:
 
@@ -185,6 +198,7 @@ The recommended NNUE workflow is:
 3. Annotate them with DeadFish scores if you want score-driven targets.
 4. Train a checkpoint in PyTorch.
 5. Export a `.nnue` blob for future engine integration.
+6. Load the exported network in UCI with `setoption name EvalFile value ...`.
 
 See [`training/README.md`](./training/README.md) for the exact commands and file flow.
 
@@ -198,6 +212,7 @@ The native test suite covers:
 - perft on the starting position, Kiwipete, and additional tactical reference positions
 - SEE regression checks for winning, equal, and losing exchanges
 - search smoke tests for mate finding, movetime limits, and clock-based limits
+- deterministic NNUE loader, fallback, and fixed-score regression checks
 - bundled-book usage and clean fallback when book or Syzygy paths are missing
 
 ## Current Roadmap Status
@@ -208,9 +223,9 @@ The current tree includes:
 - native generic-vs-tuned profiling and repeatable regression tooling
 - cutechess-based gauntlet scaffolding and a small example engine ladder
 - the first NNUE data/training/export pipeline under `training/`
+- engine-side `DFNNUE1` loading, accumulator-backed search eval, and `UseNNUE` / `EvalFile` runtime control
 
 Still planned for the engine itself:
 
-- NNUE inference and accumulator integration
-- `UseNNUE` / `EvalFile` runtime support
+- heavier real-world NNUE training runs and tuning
 - multi-threaded search with `Threads`

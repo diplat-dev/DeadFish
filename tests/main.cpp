@@ -1,7 +1,11 @@
 #include "deadfish/engine.hpp"
 
+#include <bit>
+#include <filesystem>
+#include <fstream>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,6 +49,195 @@ Engine make_search_engine() {
     options.syzygy_path.clear();
     engine.set_options(options);
     return engine;
+}
+
+constexpr int kFixtureFeatureCount = 64 * 10 * 64;
+
+constexpr int make_square(int file, int rank) {
+    return rank * 8 + file;
+}
+
+constexpr int mirror_square(int square) {
+    return square ^ 56;
+}
+
+deadfish::Color fixture_piece_color(deadfish::Piece piece) {
+    switch (piece) {
+        case deadfish::Piece::BPawn:
+        case deadfish::Piece::BKnight:
+        case deadfish::Piece::BBishop:
+        case deadfish::Piece::BRook:
+        case deadfish::Piece::BQueen:
+        case deadfish::Piece::BKing:
+            return deadfish::Color::Black;
+        case deadfish::Piece::WPawn:
+        case deadfish::Piece::WKnight:
+        case deadfish::Piece::WBishop:
+        case deadfish::Piece::WRook:
+        case deadfish::Piece::WQueen:
+        case deadfish::Piece::WKing:
+        case deadfish::Piece::None:
+        default:
+            return deadfish::Color::White;
+    }
+}
+
+deadfish::PieceType fixture_piece_type(deadfish::Piece piece) {
+    switch (piece) {
+        case deadfish::Piece::WPawn:
+        case deadfish::Piece::BPawn:
+            return deadfish::PieceType::Pawn;
+        case deadfish::Piece::WKnight:
+        case deadfish::Piece::BKnight:
+            return deadfish::PieceType::Knight;
+        case deadfish::Piece::WBishop:
+        case deadfish::Piece::BBishop:
+            return deadfish::PieceType::Bishop;
+        case deadfish::Piece::WRook:
+        case deadfish::Piece::BRook:
+            return deadfish::PieceType::Rook;
+        case deadfish::Piece::WQueen:
+        case deadfish::Piece::BQueen:
+            return deadfish::PieceType::Queen;
+        case deadfish::Piece::WKing:
+        case deadfish::Piece::BKing:
+            return deadfish::PieceType::King;
+        case deadfish::Piece::None:
+        default:
+            return deadfish::PieceType::None;
+    }
+}
+
+int fixture_piece_bucket(deadfish::Piece piece, deadfish::Color perspective) {
+    const deadfish::PieceType type = fixture_piece_type(piece);
+    if (piece == deadfish::Piece::None || type == deadfish::PieceType::King || type == deadfish::PieceType::None) {
+        return -1;
+    }
+
+    const int color_offset = fixture_piece_color(piece) == perspective ? 0 : 5;
+    int piece_offset = 0;
+    switch (type) {
+        case deadfish::PieceType::Pawn:
+            piece_offset = 0;
+            break;
+        case deadfish::PieceType::Knight:
+            piece_offset = 1;
+            break;
+        case deadfish::PieceType::Bishop:
+            piece_offset = 2;
+            break;
+        case deadfish::PieceType::Rook:
+            piece_offset = 3;
+            break;
+        case deadfish::PieceType::Queen:
+            piece_offset = 4;
+            break;
+        case deadfish::PieceType::King:
+        case deadfish::PieceType::None:
+        default:
+            return -1;
+    }
+    return color_offset + piece_offset;
+}
+
+int orient_fixture_square(int square, deadfish::Color perspective) {
+    return perspective == deadfish::Color::White ? square : mirror_square(square);
+}
+
+int fixture_feature_index(deadfish::Color perspective, int king_square, deadfish::Piece piece, int square) {
+    return orient_fixture_square(king_square, perspective) * (10 * 64)
+        + fixture_piece_bucket(piece, perspective) * 64
+        + orient_fixture_square(square, perspective);
+}
+
+void write_le_u32(std::ofstream& out, std::uint32_t value) {
+    const unsigned char bytes[4] = {
+        static_cast<unsigned char>(value & 0xFFu),
+        static_cast<unsigned char>((value >> 8) & 0xFFu),
+        static_cast<unsigned char>((value >> 16) & 0xFFu),
+        static_cast<unsigned char>((value >> 24) & 0xFFu),
+    };
+    out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+}
+
+void write_le_f32(std::ofstream& out, float value) {
+    write_le_u32(out, std::bit_cast<std::uint32_t>(value));
+}
+
+std::filesystem::path fixture_path(const std::string& name) {
+    return std::filesystem::temp_directory_path() / name;
+}
+
+std::filesystem::path write_valid_nnue_fixture() {
+    const std::filesystem::path path = fixture_path("deadfish-valid-fixture.nnue");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const std::array<char, 8> magic = {'D', 'F', 'N', 'N', 'U', 'E', '1', '\0'};
+    out.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+    write_le_u32(out, kFixtureFeatureCount);
+    write_le_u32(out, 1);
+    write_le_u32(out, 2);
+    write_le_f32(out, 100.0f);
+
+    std::vector<float> feature_weights(kFixtureFeatureCount, 0.0f);
+    const int white_king = make_square(4, 0);
+    const int black_king = make_square(4, 7);
+    const int white_queen_d4 = make_square(3, 3);
+    const int black_queen_d5 = make_square(3, 4);
+    feature_weights[fixture_feature_index(deadfish::Color::White, white_king, deadfish::Piece::WQueen, white_queen_d4)] = 0.40f;
+    feature_weights[fixture_feature_index(deadfish::Color::Black, black_king, deadfish::Piece::WQueen, white_queen_d4)] = 0.10f;
+    feature_weights[fixture_feature_index(deadfish::Color::White, white_king, deadfish::Piece::BQueen, black_queen_d5)] = 0.05f;
+    feature_weights[fixture_feature_index(deadfish::Color::Black, black_king, deadfish::Piece::BQueen, black_queen_d5)] = 0.35f;
+    for (float weight : feature_weights) {
+        write_le_f32(out, weight);
+    }
+
+    write_le_f32(out, 0.0f);
+    write_le_f32(out, 1.0f);
+    write_le_f32(out, -1.0f);
+    write_le_f32(out, -1.0f);
+    write_le_f32(out, 1.0f);
+    write_le_f32(out, 0.0f);
+    write_le_f32(out, 0.0f);
+    write_le_f32(out, 1.0f);
+    write_le_f32(out, -1.0f);
+    write_le_f32(out, 0.0f);
+    return path;
+}
+
+std::filesystem::path write_wrong_magic_nnue_fixture() {
+    const std::filesystem::path path = fixture_path("deadfish-wrong-magic.nnue");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const std::array<char, 8> magic = {'B', 'A', 'D', 'N', 'N', 'U', 'E', '\0'};
+    out.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+    write_le_u32(out, kFixtureFeatureCount);
+    write_le_u32(out, 1);
+    write_le_u32(out, 2);
+    return path;
+}
+
+std::filesystem::path write_truncated_nnue_fixture() {
+    const std::filesystem::path path = fixture_path("deadfish-truncated.nnue");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const std::array<char, 8> magic = {'D', 'F', 'N', 'N', 'U', 'E', '1', '\0'};
+    out.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+    write_le_u32(out, kFixtureFeatureCount);
+    write_le_u32(out, 1);
+    write_le_u32(out, 2);
+    write_le_f32(out, 100.0f);
+    write_le_f32(out, 0.40f);
+    return path;
+}
+
+std::filesystem::path write_bad_shape_nnue_fixture() {
+    const std::filesystem::path path = fixture_path("deadfish-bad-shape.nnue");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const std::array<char, 8> magic = {'D', 'F', 'N', 'N', 'U', 'E', '1', '\0'};
+    out.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+    write_le_u32(out, 123);
+    write_le_u32(out, 1);
+    write_le_u32(out, 1);
+    write_le_f32(out, 100.0f);
+    return path;
 }
 
 void test_fen_round_trip(TestContext& t) {
@@ -205,6 +398,103 @@ void test_search(TestContext& t) {
     t.expect(start.is_move_legal(clocked_result.best_move), "clock-based search move is legal");
 }
 
+void test_nnue_loader_and_eval(TestContext& t) {
+    const std::filesystem::path valid_fixture = write_valid_nnue_fixture();
+    const std::filesystem::path wrong_magic_fixture = write_wrong_magic_nnue_fixture();
+    const std::filesystem::path truncated_fixture = write_truncated_nnue_fixture();
+    const std::filesystem::path bad_shape_fixture = write_bad_shape_nnue_fixture();
+
+    auto cleanup = [&]() {
+        std::error_code ignored;
+        std::filesystem::remove(valid_fixture, ignored);
+        std::filesystem::remove(wrong_magic_fixture, ignored);
+        std::filesystem::remove(truncated_fixture, ignored);
+        std::filesystem::remove(bad_shape_fixture, ignored);
+    };
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.eval_file = valid_fixture.string();
+        engine.set_options(options);
+
+        t.expect(engine.nnue_loaded(), "NNUE valid fixture loads");
+        t.expect(engine.nnue_status().find("Loaded NNUE from") != std::string::npos, "NNUE load status is reported");
+
+        Position white_advantage = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        Position white_advantage_black_to_move = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 b - - 0 1");
+        Position black_advantage = Position::from_fen("4k3/8/8/3q4/8/8/8/4K3 w - - 0 1");
+        Position balanced = Position::from_fen("4k3/8/8/3q4/3Q4/8/8/4K3 w - - 0 1");
+
+        t.expect(engine.evaluate(white_advantage) == 30, "NNUE evaluates white queen fixture as +30");
+        t.expect(engine.evaluate(white_advantage_black_to_move) == -30, "NNUE flips score by side to move");
+        t.expect(engine.evaluate(black_advantage) == -30, "NNUE evaluates black queen fixture as -30");
+        t.expect(engine.evaluate(balanced) == 0, "NNUE evaluates balanced fixture as 0");
+
+        SearchLimits limits;
+        limits.max_depth = 2;
+        SearchResult result = engine.search(white_advantage, limits);
+        t.expect(!result.best_move.is_null(), "NNUE-active search returns a move");
+        t.expect(white_advantage.is_move_legal(result.best_move), "NNUE-active search move is legal");
+
+        options.eval_file = "Z:/deadfish-missing/fixture.nnue";
+        engine.set_options(options);
+        t.expect(!engine.nnue_loaded(), "invalid NNUE path unloads active network");
+        t.expect(engine.nnue_status().find("load failed") != std::string::npos, "invalid NNUE path reports fallback");
+        t.expect(engine.evaluate(white_advantage) == white_advantage.evaluate_relative(),
+                 "invalid NNUE path falls back to classical evaluation");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.eval_file = wrong_magic_fixture.string();
+        engine.set_options(options);
+        Position position = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        t.expect(!engine.nnue_loaded(), "wrong-magic NNUE fixture is rejected");
+        t.expect(engine.nnue_status().find("wrong magic") != std::string::npos, "wrong-magic rejection explains the failure");
+        t.expect(engine.evaluate(position) == position.evaluate_relative(), "wrong-magic fixture falls back to classical eval");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.eval_file = truncated_fixture.string();
+        engine.set_options(options);
+        Position position = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        t.expect(!engine.nnue_loaded(), "truncated NNUE fixture is rejected");
+        t.expect(engine.nnue_status().find("truncated") != std::string::npos, "truncated NNUE rejection explains the failure");
+        t.expect(engine.evaluate(position) == position.evaluate_relative(), "truncated NNUE fixture falls back to classical eval");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.eval_file = bad_shape_fixture.string();
+        engine.set_options(options);
+        Position position = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        t.expect(!engine.nnue_loaded(), "bad-shape NNUE fixture is rejected");
+        t.expect(engine.nnue_status().find("unsupported network dimensions") != std::string::npos,
+                 "bad-shape NNUE rejection explains the failure");
+        t.expect(engine.evaluate(position) == position.evaluate_relative(), "bad-shape NNUE fixture falls back to classical eval");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.eval_file = valid_fixture.string();
+        options.use_nnue = false;
+        engine.set_options(options);
+        Position position = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        t.expect(engine.nnue_loaded(), "UseNNUE=false still allows a network to load");
+        t.expect(engine.nnue_status().find("NNUE inactive because UseNNUE=false") != std::string::npos,
+                 "UseNNUE=false reports inactive NNUE");
+        t.expect(engine.evaluate(position) == position.evaluate_relative(), "UseNNUE=false keeps classical evaluation active");
+    }
+
+    cleanup();
+}
+
 void test_book_and_tablebase_fallbacks(TestContext& t) {
     Position start = Position::start_position();
     SearchLimits limits;
@@ -260,6 +550,7 @@ int main() {
     test_perft(t);
     test_see(t);
     test_search(t);
+    test_nnue_loader_and_eval(t);
     test_book_and_tablebase_fallbacks(t);
 
     std::cout << "\nPassed: " << t.passed << "\n";

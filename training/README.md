@@ -1,8 +1,8 @@
 # DeadFish NNUE Training
 
-This folder contains the first native training and export pipeline for DeadFish's future NNUE evaluation path.
+This folder contains the native training and export pipeline for DeadFish's NNUE evaluation path.
 
-The engine does not consume these exported networks yet. The goal of this package is to make data generation, position extraction, score annotation, training, and export repeatable before the engine-side NNUE integration lands.
+The native engine can now load exported `DFNNUE1` networks through the UCI `EvalFile` option. The goal of this package is to make data generation, position extraction, score annotation, training, and export repeatable so you can generate better networks as the engine improves.
 
 ## Requirements
 
@@ -25,6 +25,7 @@ python .\training\smoke_test.py
 3. Optionally annotate those positions with DeadFish search scores using `annotate_positions.py`.
 4. Train a HalfKP-style NNUE with `train_nnue.py`.
 5. Export a `.nnue` blob with `export_nnue.py`.
+6. Load that `.nnue` file in the engine with `EvalFile` when you want to test it.
 
 ## End-To-End Workflow
 
@@ -113,6 +114,14 @@ Default output:
 
 `--inspect` reads the export back immediately and validates its tensor shapes.
 
+You can then test the exported network in DeadFish:
+
+```text
+setoption name EvalFile value C:\path\to\training\output\deadfish.nnue
+setoption name UseNNUE value true
+isready
+```
+
 ## Short Command Chain
 
 For a straightforward full pass:
@@ -140,7 +149,7 @@ If `score_cp` is present it is used as the primary training target. Otherwise th
 
 ## Notes
 
-- The engine does not consume these exported weights yet; this pipeline prepares data and artifacts for the upcoming engine-side NNUE integration.
+- The engine consumes the exported float32 `DFNNUE1` weights directly through `EvalFile`, with safe fallback to classical eval if the file is invalid or not set.
 - Long self-play generation, annotation runs, and real training loops are intentionally separated so you can run heavy steps later when plugged in or on a larger machine.
 - Generated datasets, checkpoints, and exports are ignored by git through the repo-level `.gitignore`.
 
