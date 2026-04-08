@@ -61,6 +61,8 @@ class GameController:
         self.analysis = AnalysisSnapshot()
         self.status_text = "No engine loaded."
         self.move_time_ms = 500
+        self.search_depth = 5
+        self.play_search_mode = "movetime"
         self.play_mode = True
         self.analysis_enabled = False
         self.human_color = chess.WHITE
@@ -197,8 +199,27 @@ class GameController:
         except (TypeError, ValueError):
             return
         self.move_time_ms = max(1, number)
-        if self.play_mode and self.board.turn != self.human_color:
-            self._sync_search_state(force_restart=True)
+        self._restart_play_search_if_needed()
+
+    def set_search_depth(self, value: Any) -> None:
+        try:
+            number = int(str(value).strip())
+        except (TypeError, ValueError):
+            return
+        self.search_depth = max(1, number)
+        self._restart_play_search_if_needed()
+
+    def set_play_search_mode(self, mode: str) -> None:
+        normalized = mode.strip().casefold()
+        if normalized not in {"movetime", "depth"}:
+            return
+        self.play_search_mode = normalized
+        self.status_text = (
+            "Engine reply limit set to movetime."
+            if normalized == "movetime"
+            else "Engine reply limit set to depth."
+        )
+        self._restart_play_search_if_needed()
 
     def press_button_option(self, name: str) -> None:
         if name not in self.engine_options or self.engine_options[name].kind != "button":
@@ -423,6 +444,10 @@ class GameController:
             return "analysis"
         return None
 
+    def _restart_play_search_if_needed(self) -> None:
+        if self.play_mode and self.board.turn != self.human_color:
+            self._sync_search_state(force_restart=True)
+
     def _sync_search_state(self, *, force_restart: bool) -> None:
         desired = self._desired_search_kind()
         if self.client is None:
@@ -473,9 +498,13 @@ class GameController:
             self.search_kind = "analysis"
             self.status_text = "Analyzing current position..."
             return
-        self.client.send(f"go movetime {self.move_time_ms}")
+        if self.play_search_mode == "depth":
+            self.client.send(f"go depth {self.search_depth}")
+            self.status_text = f"Engine thinking to depth {self.search_depth}..."
+        else:
+            self.client.send(f"go movetime {self.move_time_ms}")
+            self.status_text = f"Engine thinking for {self.move_time_ms} ms..."
         self.search_kind = "play"
-        self.status_text = "Engine thinking..."
 
     def _apply_engine_move(self, bestmove: str) -> None:
         if bestmove in {"", "0000"}:

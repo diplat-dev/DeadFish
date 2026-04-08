@@ -52,9 +52,11 @@ class BoardCanvas(tk.Canvas):
         self.app = app
         self.flipped = False
         self.selected_square: int | None = None
+        self.press_square: int | None = None
         self.drag_origin: int | None = None
         self.drag_piece: chess.Piece | None = None
         self.drag_started = False
+        self.press_pointer: tuple[float, float] = (0.0, 0.0)
         self.drag_pointer: tuple[float, float] = (0.0, 0.0)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_motion)
@@ -68,6 +70,7 @@ class BoardCanvas(tk.Canvas):
 
     def clear_selection(self) -> None:
         self.selected_square = None
+        self.press_square = None
         self.redraw()
 
     def redraw(self) -> None:
@@ -197,18 +200,22 @@ class BoardCanvas(tk.Canvas):
 
     def _on_press(self, event: tk.Event[tk.Misc]) -> None:
         square = self._square_from_xy(event.x, event.y)
+        self.press_square = square
+        self.press_pointer = (event.x, event.y)
+        self.drag_pointer = (event.x, event.y)
+        self.drag_started = False
         if square is None or not self.app.controller.can_user_move_piece(square):
+            self.drag_origin = None
+            self.drag_piece = None
             return
         self.drag_origin = square
         self.drag_piece = self.app.controller.board.piece_at(square)
-        self.drag_started = False
-        self.drag_pointer = (event.x, event.y)
 
     def _on_motion(self, event: tk.Event[tk.Misc]) -> None:
         if self.drag_origin is None or self.drag_piece is None:
             return
-        dx = event.x - self.drag_pointer[0]
-        dy = event.y - self.drag_pointer[1]
+        dx = event.x - self.press_pointer[0]
+        dy = event.y - self.press_pointer[1]
         if not self.drag_started and abs(dx) + abs(dy) > 6:
             self.drag_started = True
             self.selected_square = self.drag_origin
@@ -220,19 +227,23 @@ class BoardCanvas(tk.Canvas):
         release_square = self._square_from_xy(event.x, event.y)
         origin = self.drag_origin
         dragged = self.drag_started
+        pressed_square = self.press_square
+        self.press_square = None
         self.drag_origin = None
         self.drag_piece = None
         self.drag_started = False
-        if origin is None:
-            return
-        if dragged and release_square is not None:
+        if dragged and origin is not None and release_square is not None:
             self.selected_square = origin
             self.redraw()
             if self._attempt_move(origin, release_square):
                 self.selected_square = None
             self.redraw()
             return
-        self._handle_click(release_square)
+        if dragged:
+            self.selected_square = origin
+            self.redraw()
+            return
+        self._handle_click(release_square if release_square is not None else pressed_square)
 
     def _handle_click(self, square: int | None) -> None:
         controller = self.app.controller
@@ -292,7 +303,9 @@ class GuiApp:
         self.play_mode_var = tk.BooleanVar(value=True)
         self.analysis_enabled_var = tk.BooleanVar(value=False)
         self.flipped_var = tk.BooleanVar(value=False)
-        self.movetime_var = tk.StringVar(value=str(self.controller.move_time_ms))
+        self.play_limit_mode_var = tk.StringVar(value=self.controller.play_search_mode)
+        self.play_limit_label_var = tk.StringVar(value=self._play_limit_label())
+        self.play_limit_value_var = tk.StringVar(value=self._play_limit_value())
 
         self.option_vars: dict[str, tk.Variable] = {}
         self.rendered_settings_version = -1
@@ -402,11 +415,22 @@ class GuiApp:
             variable=self.analysis_enabled_var,
             command=self._toggle_analysis,
         ).pack(side="left", padx=(14, 0))
-        ttk.Label(control_row, text="Movetime (ms)").pack(side="left", padx=(18, 6))
-        movetime = ttk.Spinbox(control_row, from_=1, to=600000, textvariable=self.movetime_var, width=8)
-        movetime.pack(side="left")
-        movetime.bind("<FocusOut>", lambda _event: self._apply_movetime())
-        movetime.bind("<Return>", lambda _event: self._apply_movetime())
+        ttk.Label(control_row, text="Reply Limit").pack(side="left", padx=(18, 6))
+        limit_mode = ttk.Combobox(
+            control_row,
+            textvariable=self.play_limit_mode_var,
+            values=("movetime", "depth"),
+            state="readonly",
+            width=10,
+        )
+        limit_mode.pack(side="left")
+        limit_mode.bind("<<ComboboxSelected>>", lambda _event: self._apply_play_limit_mode())
+        ttk.Label(control_row, textvariable=self.play_limit_label_var).pack(side="left", padx=(12, 6))
+        self.play_limit_spinbox = ttk.Spinbox(control_row, width=8, textvariable=self.play_limit_value_var)
+        self.play_limit_spinbox.pack(side="left")
+        self.play_limit_spinbox.bind("<FocusOut>", lambda _event: self._apply_play_limit_value())
+        self.play_limit_spinbox.bind("<Return>", lambda _event: self._apply_play_limit_value())
+        self._sync_play_limit_widget()
 
         metrics = ttk.Frame(parent, style="Panel.TFrame")
         metrics.pack(fill="x", pady=(14, 10))
@@ -508,9 +532,35 @@ class GuiApp:
     def _toggle_analysis(self) -> None:
         self.controller.set_analysis_enabled(self.analysis_enabled_var.get())
 
-    def _apply_movetime(self) -> None:
-        self.controller.set_move_time_ms(self.movetime_var.get())
-        self.movetime_var.set(str(self.controller.move_time_ms))
+    def _play_limit_label(self) -> str:
+        return "Movetime (ms)" if self.controller.play_search_mode == "movetime" else "Depth"
+
+    def _play_limit_value(self) -> str:
+        if self.controller.play_search_mode == "movetime":
+            return str(self.controller.move_time_ms)
+        return str(self.controller.search_depth)
+
+    def _sync_play_limit_widget(self) -> None:
+        if not hasattr(self, "play_limit_spinbox"):
+            return
+        if self.controller.play_search_mode == "movetime":
+            self.play_limit_spinbox.configure(from_=1, to=600000)
+        else:
+            self.play_limit_spinbox.configure(from_=1, to=100)
+        self.play_limit_label_var.set(self._play_limit_label())
+        self.play_limit_value_var.set(self._play_limit_value())
+
+    def _apply_play_limit_mode(self) -> None:
+        self.controller.set_play_search_mode(self.play_limit_mode_var.get())
+        self.play_limit_mode_var.set(self.controller.play_search_mode)
+        self._sync_play_limit_widget()
+
+    def _apply_play_limit_value(self) -> None:
+        if self.controller.play_search_mode == "movetime":
+            self.controller.set_move_time_ms(self.play_limit_value_var.get())
+        else:
+            self.controller.set_search_depth(self.play_limit_value_var.get())
+        self._sync_play_limit_widget()
 
     def _toggle_flip(self) -> None:
         self.flipped_var.set(not self.flipped_var.get())
@@ -698,7 +748,9 @@ class GuiApp:
         self.fen_var.set(self.controller.current_fen())
         self.play_mode_var.set(self.controller.play_mode)
         self.analysis_enabled_var.set(self.controller.analysis_enabled)
-        self.movetime_var.set(str(self.controller.move_time_ms))
+        self.play_limit_mode_var.set(self.controller.play_search_mode)
+        self.play_limit_label_var.set(self._play_limit_label())
+        self.play_limit_value_var.set(self._play_limit_value())
 
         moves_text = self.controller.move_history_text()
         if moves_text != self.last_moves_text:

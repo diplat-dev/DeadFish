@@ -129,10 +129,24 @@ def main() -> int:
     if applied:
         pump(controller, lambda: controller.engine_ready and controller.applied_option_values.get("UseNNUE") is False)
 
+    controller.set_play_search_mode("depth")
+    controller.set_search_depth(2)
+    expect(controller.play_search_mode == "depth", "controller switches engine reply mode to depth")
+    expect(controller.search_depth == 2, "controller stores the configured play depth")
     result = controller.make_user_move_uci("e2e4")
     expect(result.status == "applied", "legal human move is applied")
     pump(controller, lambda: len(controller.board.move_stack) >= 2, timeout=10.0)
-    expect(len(controller.board.move_stack) >= 2, "engine reply is applied after a human move")
+    expect(len(controller.board.move_stack) >= 2, "engine reply is applied after a human move in depth mode")
+
+    controller.new_game()
+    controller.set_play_search_mode("movetime")
+    controller.set_move_time_ms(150)
+    expect(controller.play_search_mode == "movetime", "controller switches engine reply mode to movetime")
+    expect(controller.move_time_ms == 150, "controller stores the configured movetime")
+    result = controller.make_user_move_uci("d2d4")
+    expect(result.status == "applied", "legal human move is applied in movetime mode")
+    pump(controller, lambda: len(controller.board.move_stack) >= 2, timeout=10.0)
+    expect(len(controller.board.move_stack) >= 2, "engine reply is applied after a human move in movetime mode")
 
     controller.set_play_mode(False)
     controller.set_analysis_enabled(False)
