@@ -423,10 +423,16 @@ class GuiApp:
             state="readonly",
             width=10,
         )
+        self.play_limit_mode_combo = limit_mode
         limit_mode.pack(side="left")
         limit_mode.bind("<<ComboboxSelected>>", lambda _event: self._apply_play_limit_mode())
         ttk.Label(control_row, textvariable=self.play_limit_label_var).pack(side="left", padx=(12, 6))
-        self.play_limit_spinbox = ttk.Spinbox(control_row, width=8, textvariable=self.play_limit_value_var)
+        self.play_limit_spinbox = ttk.Spinbox(
+            control_row,
+            width=8,
+            textvariable=self.play_limit_value_var,
+            command=self._apply_play_limit_value,
+        )
         self.play_limit_spinbox.pack(side="left")
         self.play_limit_spinbox.bind("<FocusOut>", lambda _event: self._apply_play_limit_value())
         self.play_limit_spinbox.bind("<Return>", lambda _event: self._apply_play_limit_value())
@@ -732,6 +738,7 @@ class GuiApp:
         widget.configure(state="disabled")
 
     def _refresh_ui(self) -> None:
+        focus_widget = self.root.focus_get()
         self.status_var.set(self.controller.status_text)
         engine_name = self.controller.engine_identity.name or (
             self.controller.engine_path.name if self.controller.engine_path else "None"
@@ -748,9 +755,11 @@ class GuiApp:
         self.fen_var.set(self.controller.current_fen())
         self.play_mode_var.set(self.controller.play_mode)
         self.analysis_enabled_var.set(self.controller.analysis_enabled)
-        self.play_limit_mode_var.set(self.controller.play_search_mode)
         self.play_limit_label_var.set(self._play_limit_label())
-        self.play_limit_value_var.set(self._play_limit_value())
+        if focus_widget is not getattr(self, "play_limit_mode_combo", None):
+            self.play_limit_mode_var.set(self.controller.play_search_mode)
+        if focus_widget is not getattr(self, "play_limit_spinbox", None):
+            self.play_limit_value_var.set(self._play_limit_value())
 
         moves_text = self.controller.move_history_text()
         if moves_text != self.last_moves_text:
