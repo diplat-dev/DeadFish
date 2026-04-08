@@ -24,3 +24,4 @@ tools/emsdk/
 
 RUNBOOK.txt
 .tmp_stockfish/
+.tmp_datasets/

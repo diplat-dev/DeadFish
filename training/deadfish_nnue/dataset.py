@@ -22,6 +22,7 @@ class PositionRecord:
     target: float
     weight: float
     raw: dict[str, object]
+    game_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -32,6 +33,8 @@ class LoadStats:
     outcome_records: int = 0
     mate_records: int = 0
     skipped_mate_records: int = 0
+    non_cp_records: int = 0
+    skipped_non_cp_records: int = 0
     clipped_records: int = 0
     abs_le_25: int = 0
     abs_le_50: int = 0
@@ -60,7 +63,13 @@ def _bucket_score(stats: LoadStats, score_cp: float) -> None:
         stats.abs_le_800 += 1
 
 
-def _normalized_target(record: dict[str, object], clip_cp: float, stats: LoadStats | None = None) -> float:
+def _normalized_target(
+    record: dict[str, object],
+    clip_cp: float,
+    *,
+    target_mode: str = "score-or-outcome",
+    stats: LoadStats | None = None,
+) -> float:
     score_kind = record.get("score_kind")
     if score_kind == "mate":
         if stats is not None:
@@ -75,6 +84,12 @@ def _normalized_target(record: dict[str, object], clip_cp: float, stats: LoadSta
                 stats.clipped_records += 1
         score_cp = max(-clip_cp, min(clip_cp, score_cp))
         return score_cp / clip_cp
+    if target_mode == "teacher-cp":
+        if stats is not None:
+            stats.non_cp_records += 1
+            if record.get("outcome") is not None:
+                stats.outcome_records += 1
+        raise ValueError("teacher-cp mode requires score_cp")
     if "wdl" in record and record["wdl"] is not None:
         value = float(record["wdl"])
         return max(-1.0, min(1.0, value * 2.0 - 1.0))
@@ -89,6 +104,7 @@ def load_jsonl_records(
     path: Path,
     max_positions: int = 0,
     clip_cp: float = 1200.0,
+    target_mode: str = "score-or-outcome",
     stats: LoadStats | None = None,
 ) -> list[PositionRecord]:
     records: list[PositionRecord] = []
@@ -102,14 +118,26 @@ def load_jsonl_records(
             raw = json.loads(line)
             fen = str(raw["fen"])
             try:
-                target = _normalized_target(raw, clip_cp, stats=stats)
+                target = _normalized_target(raw, clip_cp, target_mode=target_mode, stats=stats)
             except ValueError as exc:
-                if stats is not None and "mate-score records" in str(exc):
-                    stats.skipped_mate_records += 1
+                message = str(exc)
+                if "mate-score records" in message:
+                    if stats is not None:
+                        stats.skipped_mate_records += 1
+                    continue
+                if "teacher-cp mode requires score_cp" in message:
+                    if stats is not None:
+                        stats.skipped_non_cp_records += 1
                     continue
                 raise
             weight = float(raw.get("weight", 1.0))
-            records.append(PositionRecord(fen=fen, target=target, weight=weight, raw=raw))
+            game_index_raw = raw.get("game_index")
+            game_index: int | None = None
+            if isinstance(game_index_raw, int):
+                game_index = game_index_raw
+            elif isinstance(game_index_raw, float) and game_index_raw.is_integer():
+                game_index = int(game_index_raw)
+            records.append(PositionRecord(fen=fen, target=target, weight=weight, raw=raw, game_index=game_index))
             if stats is not None:
                 stats.loaded_records += 1
             if max_positions > 0 and len(records) >= max_positions:

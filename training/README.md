@@ -22,7 +22,7 @@ python .\training\smoke_test.py
 
 1. Generate self-play PGNs with `generate_selfplay_pgn.py`, or use external PGNs from cutechess.
 2. Extract sampled training positions with `extract_positions.py`.
-3. Optionally annotate those positions with DeadFish search scores using `annotate_positions.py`.
+3. Optionally annotate those positions with a generic UCI teacher using `annotate_positions.py`.
 4. Train a HalfKP-style NNUE with `train_nnue.py`.
 5. Export a `.nnue` blob with `export_nnue.py`.
 6. Load that `.nnue` file in the engine with `EvalFile` when you want to test it.
@@ -60,35 +60,42 @@ Useful knobs:
 - `--max-games`
 - `--max-positions`
 
-### 3. Annotate positions with DeadFish scores
+### 3. Annotate positions with teacher scores
 
-If you want search-score targets instead of outcome-only targets:
+If you want direct teacher centipawn targets instead of outcome-only targets:
 
 ```powershell
-python .\training\annotate_positions.py --input .\training\output\positions.jsonl --depth 8 --workers 0
+python .\training\annotate_positions.py --engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --input .\training\output\positions.jsonl --output .\training\output\positions_stockfish.jsonl --nodes 50000 --workers 0 --option Threads=1
 ```
 
 Default output:
 
-- `training/output/positions_annotated.jsonl`
+- `training/output/positions_stockfish.jsonl`
 
-This step drives the current native engine through UCI, disables the opening book, and records:
+This step drives a generic UCI teacher through UCI, disables the opening book when supported, and records:
 
 - `score_kind`
 - `score_value`
 - `score_cp`
 - `annotated_depth`
+- `annotated_nodes`
 - `best_move`
 - `pv`
 
 Mate scores are preserved as `score_kind = "mate"` and `score_value = ...`. They are excluded from score-supervised NNUE training by default instead of being flattened into fake centipawn labels.
 
-If you want a lighter run on battery or limited time, use `--movetime` or `--limit`. `--workers 0` means auto based on CPU count.
+`annotate_positions.py` now supports exactly one search budget at a time:
+
+- `--depth`
+- `--movetime`
+- `--nodes`
+
+For the current recovery workflow, use `--nodes` so the teacher labels are generated with a fixed node budget. `--workers 0` means auto based on CPU count.
 
 ### 4. Train a checkpoint
 
 ```powershell
-python .\training\train_nnue.py --input .\training\output\positions_annotated.jsonl
+python .\training\train_nnue.py --input .\training\output\positions_stockfish.jsonl --target-mode teacher-cp --epochs 8
 ```
 
 Default output:
@@ -105,14 +112,16 @@ Useful knobs:
 - `--accumulator-size`
 - `--hidden-size`
 
-If you skip the annotation step, `train_nnue.py` can still train from raw extracted positions by falling back to `outcome`.
+If you skip the annotation step, `train_nnue.py` can still train from raw extracted positions by falling back to `outcome`, but the current recovery workflow is built around `--target-mode teacher-cp`.
 
 The trainer now:
 
 - uses `clip_cp = 1200` by default
 - uses `output_scale = clip_cp` by default unless you override it
+- splits train and validation by `game_index` instead of random position-level splitting
 - prints JSON summary data including train/validation loss and load statistics
 - skips mate-labeled search targets by default
+- can require `score_cp` with `--target-mode teacher-cp`, which skips mate and outcome-only records
 
 ### 5. Export a `.nnue` file
 
@@ -143,7 +152,21 @@ Before benchmarking, make sure Python inference, the exported `.nnue`, and the e
 python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue
 ```
 
-### 7. Run the fixed benchmark gate
+### 7. Run the sanity and holdout report
+
+Before match play, compare teacher, classical, and NNUE on the fixed sanity suite and a sampled holdout:
+
+```powershell
+python .\scripts\nnue_eval_report.py --eval-file .\training\output\deadfish.nnue --teacher-engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --teacher-nodes 50000 --input .\training\output\positions_stockfish.jsonl
+```
+
+This report:
+
+- scores the committed sanity suite in `data/nnue_sanity_suite.jsonl`
+- compares teacher, classical, and NNUE at the root and on one-ply child positions
+- samples the labeled holdout set and reports error metrics plus score distributions
+
+### 8. Run the fixed benchmark gate
 
 Benchmark NNUE against the classical evaluator with the fixed balanced opening suite:
 
@@ -152,44 +175,36 @@ python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue -
 python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode strength --require-positive
 ```
 
-### 8. Compare against teacher labels before match play
-
-If your JSONL was annotated by a stronger teacher such as Stockfish, compare DeadFish eval directly against those labels:
-
-```powershell
-python .\scripts\teacher_holdout.py --input .\training\output\positions_annotated.jsonl --eval-file .\training\output\deadfish.nnue --mode both
-```
-
-This gives you a quick sanity check for whether NNUE is actually moving closer to the teacher than the classical evaluator is.
-
 ## Imported PGN + Stockfish Teacher
 
 If you already have PGNs and want a stronger initial teacher than DeadFish:
 
 ```powershell
 python .\training\extract_positions.py --input-pgn C:\path\to\imported_games.pgn
-python .\training\annotate_positions.py --engine C:\engines\stockfish\stockfish.exe --input .\training\output\positions.jsonl --output .\training\output\positions_stockfish.jsonl --depth 10 --workers 0 --option Threads=1
-python .\training\train_nnue.py --input .\training\output\positions_stockfish.jsonl --epochs 8
+python .\training\annotate_positions.py --engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --input .\training\output\positions.jsonl --output .\training\output\positions_stockfish.jsonl --nodes 50000 --workers 0 --option Threads=1
+python .\training\train_nnue.py --input .\training\output\positions_stockfish.jsonl --target-mode teacher-cp --epochs 8
 python .\training\export_nnue.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --write-metadata --inspect
 python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue
-python .\scripts\teacher_holdout.py --input .\training\output\positions_stockfish.jsonl --eval-file .\training\output\deadfish.nnue --mode both
+python .\scripts\nnue_eval_report.py --eval-file .\training\output\deadfish.nnue --teacher-engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --teacher-nodes 50000 --input .\training\output\positions_stockfish.jsonl
 python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode quick
+python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode strength --require-positive
 ```
 
 `annotate_positions.py` now detects advertised UCI options and only sends supported defaults. Extra `--option NAME=VALUE` settings are applied when the teacher engine supports them.
 
 ## Short Command Chain
 
-For the current recovery recipe:
+For the current teacher-CP recovery recipe:
 
 ```powershell
-python .\training\generate_selfplay_pgn.py --games 5000 --concurrency 0
-python .\training\extract_positions.py --input-pgn .\training\output\selfplay.pgn
-python .\training\annotate_positions.py --input .\training\output\positions.jsonl --depth 8 --workers 0
-python .\training\train_nnue.py --input .\training\output\positions_annotated.jsonl
+python .\training\extract_positions.py --input-pgn C:\path\to\imported_games.pgn
+python .\training\annotate_positions.py --engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --input .\training\output\positions.jsonl --output .\training\output\positions_stockfish.jsonl --nodes 50000 --workers 0 --option Threads=1
+python .\training\train_nnue.py --input .\training\output\positions_stockfish.jsonl --target-mode teacher-cp --epochs 8
 python .\training\export_nnue.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --write-metadata --inspect
 python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue
+python .\scripts\nnue_eval_report.py --eval-file .\training\output\deadfish.nnue --teacher-engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --teacher-nodes 50000 --input .\training\output\positions_stockfish.jsonl
 python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode quick
+python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode strength --require-positive
 ```
 
 ## Data Format
@@ -202,10 +217,11 @@ The extracted and annotated datasets use JSON Lines. Each record includes:
 - `score_kind`: optional annotated score type (`cp` or `mate`)
 - `score_value`: raw annotated score value
 - `score_cp`: optional annotated centipawn score, present only for `score_kind = "cp"`
+- `annotated_nodes`: optional actual or requested node budget for teacher annotation
 - `best_move`: optional annotated best move
 - `pv`: optional principal variation
 
-If `score_cp` is present it is used as the primary training target. Mate-labeled search scores are skipped by default. If no score is present, the trainer falls back to the game outcome.
+If `score_cp` is present it is used as the primary training target. Mate-labeled search scores are skipped by default. In `--target-mode teacher-cp`, the trainer also skips outcome-only records and requires `score_cp` on every loaded sample.
 
 ## Notes
 

@@ -98,7 +98,17 @@ python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnu
 
 This compares Python checkpoint inference, exported `.nnue` inference, and `deadfish eval` on the same FENs. It should pass before you trust match results.
 
-### 4. Standard NNUE gate
+### 4. NNUE sanity and holdout report
+
+Use this after parity and before match play:
+
+```powershell
+python .\scripts\nnue_eval_report.py --eval-file .\training\output\deadfish.nnue --teacher-engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --teacher-nodes 50000 --input .\training\output\positions_stockfish.jsonl
+```
+
+This compares teacher, classical, and NNUE static eval on a fixed sanity suite plus a sampled teacher-labeled holdout set. It also inspects one-ply child positions from the sanity suite so root-only parity is not the only signal.
+
+### 5. Standard NNUE gate
 
 Use this for classical-vs-NNUE checks with a fixed balanced opening suite:
 
@@ -109,7 +119,7 @@ python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue -
 
 `quick` is a fast smoke gate. `strength` is the first real acceptance gate. Both use `data/nnue_openings.pgn` instead of training self-play games.
 
-### 5. Small internal engine match
+### 6. Small internal engine match
 
 Use this when comparing two DeadFish builds:
 
@@ -119,7 +129,7 @@ python .\scripts\selfplay_gauntlet.py --engine-b path\to\other\deadfish.exe --mo
 
 This is a quick native regression check, not a replacement for a serious Elo run.
 
-### 6. External engine ladder
+### 7. External engine ladder
 
 Use this when comparing DeadFish against a small known ladder:
 
@@ -156,6 +166,9 @@ Implemented UCI options:
 
 `UseNNUE` defaults to `true`, but NNUE is only active when you explicitly load a valid network through `EvalFile`. If `EvalFile` is empty, missing, unreadable, or invalid, DeadFish stays fully usable and falls back to the classical evaluator.
 
+Current note:
+the NNUE pipeline is still experimental, and current trained nets have been underperforming the classical evaluator in match play even when parity and loader checks pass. For normal use, classical mode is still the recommended default.
+
 Example:
 
 ```text
@@ -163,6 +176,19 @@ setoption name EvalFile value C:\path\to\deadfish.nnue
 setoption name UseNNUE value true
 isready
 ```
+
+To force classical mode and keep NNUE from interfering:
+
+```text
+setoption name UseNNUE value false
+setoption name EvalFile value
+isready
+```
+
+In a UCI GUI, the simplest safe setup is:
+
+- leave `EvalFile` empty
+- set `UseNNUE` to `false`
 
 ## CLI Commands
 
@@ -189,6 +215,8 @@ The `eval` command is useful for NNUE debugging and parity checks. It returns th
   Compares the generic and native-tuned DeadFish builds on the fixed bench suite and reports elapsed-time and NPS speedups.
 - `python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue`
   Verifies that the Python checkpoint, exported `.nnue`, and engine runtime agree within a small centipawn tolerance on a fixed FEN suite plus sampled JSONL positions.
+- `python .\scripts\nnue_eval_report.py --eval-file .\training\output\deadfish.nnue --teacher-engine path\to\stockfish.exe --input .\training\output\positions_stockfish.jsonl`
+  Compares teacher, classical, and NNUE eval on the fixed sanity suite and a sampled holdout, including one-ply child positions and score-distribution summaries.
 - `python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode quick`
   Runs the standardized classical-vs-NNUE benchmark gate with `data/nnue_openings.pgn`.
 - `python .\scripts\teacher_holdout.py --input .\training\output\positions_annotated.jsonl --eval-file .\training\output\deadfish.nnue --mode both`
@@ -213,7 +241,7 @@ The NNUE data and training flow lives under [`training/`](./training/README.md).
 - `extract_positions.py`
   Samples JSONL training positions from PGN games.
 - `annotate_positions.py`
-  Annotates JSONL positions with DeadFish UCI search scores.
+  Annotates JSONL positions with scores from a generic UCI teacher using depth, movetime, or fixed nodes.
 - `train_nnue.py`
   Trains a first-pass HalfKP-style NNUE checkpoint in PyTorch.
 - `export_nnue.py`
@@ -223,14 +251,15 @@ The native engine can now load exported `DFNNUE1` networks directly through `Eva
 
 The recommended NNUE workflow is:
 
-1. Generate or collect PGNs.
+1. Collect imported PGNs.
 2. Extract sampled positions to JSONL.
-3. Annotate them with DeadFish scores if you want score-driven targets.
-4. Train a checkpoint in PyTorch.
+3. Annotate them with Stockfish using a fixed node budget.
+4. Train a checkpoint in PyTorch with `--target-mode teacher-cp`.
 5. Export a `.nnue` blob.
-6. Run the parity check before benchmarking.
-7. Benchmark classical vs NNUE with the fixed opening suite.
-8. Only after the internal gate is positive, run the external ladder.
+6. Run the parity check.
+7. Run the sanity and holdout report.
+8. Benchmark classical vs NNUE with the fixed opening suite.
+9. Only after the internal gate is positive, run the external ladder.
 
 See [`training/README.md`](./training/README.md) for the exact commands and file flow.
 

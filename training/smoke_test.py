@@ -18,14 +18,17 @@ def main() -> int:
     import torch
     from torch.utils.data import DataLoader
 
-    from deadfish_nnue import DeadFishNNUE, JsonlPositionDataset, NetworkConfig, collate_records, export_model, load_jsonl_records
+    from deadfish_nnue import DeadFishNNUE, JsonlPositionDataset, LoadStats, NetworkConfig, collate_records, export_model, load_jsonl_records
     from deadfish_nnue.export import read_export
+    from train_nnue import split_records_by_game
 
     sample_records = [
-        {"fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1", "score_cp": 30},
-        {"fen": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", "score_cp": 10},
-        {"fen": "4k3/8/8/8/3r4/4Q3/8/4K3 w - - 0 1", "score_cp": 850},
-        {"fen": "7k/P7/8/8/8/8/8/K7 w - - 0 1", "score_cp": 900},
+        {"fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1", "score_kind": "cp", "score_cp": 30, "game_index": 1},
+        {"fen": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", "score_kind": "cp", "score_cp": 10, "game_index": 1},
+        {"fen": "4k3/8/8/8/3r4/4Q3/8/4K3 w - - 0 1", "score_kind": "cp", "score_cp": 850, "game_index": 2},
+        {"fen": "7k/P7/8/8/8/8/8/K7 w - - 0 1", "score_kind": "cp", "score_cp": 900, "game_index": 3},
+        {"fen": "Q7/7R/8/8/2K2k2/8/8/8 w - - 1 74", "score_kind": "mate", "score_value": 3, "score_cp": None, "game_index": 4},
+        {"fen": "8/8/8/8/8/8/5k2/6K1 w - - 0 1", "outcome": 0.0, "game_index": 5},
     ]
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -33,7 +36,21 @@ def main() -> int:
         dataset_path = tmp_path / "sample.jsonl"
         dataset_path.write_text("".join(json.dumps(record) + "\n" for record in sample_records), encoding="utf-8")
 
-        records = load_jsonl_records(dataset_path, clip_cp=1200.0)
+        stats = LoadStats()
+        records = load_jsonl_records(dataset_path, clip_cp=1200.0, target_mode="teacher-cp", stats=stats)
+        assert len(records) == 4
+        assert stats.score_cp_records == 4
+        assert stats.mate_records == 1
+        assert stats.skipped_mate_records == 1
+        assert stats.non_cp_records == 1
+        assert stats.skipped_non_cp_records == 1
+        training_records, validation_records = split_records_by_game(records, validation_split=0.25, seed=1337)
+        training_games = {record.game_index for record in training_records}
+        validation_games = {record.game_index for record in validation_records}
+        assert training_games.isdisjoint(validation_games)
+        assert training_games
+        assert validation_games
+
         config = NetworkConfig(accumulator_size=16, hidden_size=8, output_scale=1200.0)
         model = DeadFishNNUE(config)
         loader = DataLoader(JsonlPositionDataset(records), batch_size=2, shuffle=False, collate_fn=collate_records)

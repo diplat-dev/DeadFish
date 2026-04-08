@@ -75,6 +75,40 @@ def checkpoint_safe_value(value):
     return value
 
 
+def unique_game_indices(records) -> set[int]:
+    return {record.game_index for record in records if record.game_index is not None}
+
+
+def split_records_by_game(records, validation_split: float, seed: int):
+    grouped: dict[int, list] = {}
+    for record in records:
+        if record.game_index is None:
+            raise ValueError(
+                "Automatic validation splitting requires game_index on every record. "
+                "Use extract_positions.py or provide --validation explicitly."
+            )
+        grouped.setdefault(record.game_index, []).append(record)
+
+    game_ids = list(grouped)
+    if len(game_ids) < 2:
+        raise ValueError("Automatic validation splitting requires at least two distinct game_index values.")
+
+    rng = random.Random(seed)
+    rng.shuffle(game_ids)
+
+    validation_game_count = int(len(game_ids) * validation_split)
+    validation_game_count = min(max(validation_game_count, 1), max(1, len(game_ids) - 1))
+    validation_ids = set(game_ids[:validation_game_count])
+
+    validation_records = []
+    training_records = []
+    for game_id in game_ids:
+        target = validation_records if game_id in validation_ids else training_records
+        target.extend(grouped[game_id])
+
+    return training_records, validation_records
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train a first-pass DeadFish HalfKP NNUE checkpoint.")
     parser.add_argument("--input", type=Path, required=True, help="Input JSONL dataset.")
@@ -82,6 +116,12 @@ def main() -> int:
     parser.add_argument("--max-positions", type=int, default=0, help="Optional cap on loaded positions.")
     parser.add_argument("--clip-cp", type=float, default=1200.0, help="Centipawn clip used for score normalization.")
     parser.add_argument("--validation-split", type=float, default=0.05, help="Validation split when no separate file is provided.")
+    parser.add_argument(
+        "--target-mode",
+        choices=("score-or-outcome", "teacher-cp"),
+        default="score-or-outcome",
+        help="Training target mode. teacher-cp requires score_cp labels and skips mate/outcome-only records.",
+    )
     parser.add_argument("--batch-size", type=int, default=256, help="Training batch size.")
     parser.add_argument("--epochs", type=int, default=4, help="Number of training epochs.")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="AdamW learning rate.")
@@ -115,20 +155,31 @@ def main() -> int:
         raise FileNotFoundError(f"Training dataset not found: {input_path}")
 
     load_stats = LoadStats()
-    all_records = load_jsonl_records(input_path, max_positions=args.max_positions, clip_cp=args.clip_cp, stats=load_stats)
+    all_records = load_jsonl_records(
+        input_path,
+        max_positions=args.max_positions,
+        clip_cp=args.clip_cp,
+        target_mode=args.target_mode,
+        stats=load_stats,
+    )
     rng = random.Random(args.seed)
     rng.shuffle(all_records)
 
     if args.validation:
-        validation_records = load_jsonl_records(args.validation.resolve(), clip_cp=args.clip_cp)
+        validation_records = load_jsonl_records(
+            args.validation.resolve(),
+            clip_cp=args.clip_cp,
+            target_mode=args.target_mode,
+        )
         training_records = all_records
     else:
         if len(all_records) < 2:
             raise ValueError("Automatic validation splitting requires at least two records.")
-        validation_size = int(len(all_records) * args.validation_split)
-        validation_size = min(max(validation_size, 1), max(1, len(all_records) - 1))
-        validation_records = all_records[:validation_size]
-        training_records = all_records[validation_size:]
+        training_records, validation_records = split_records_by_game(all_records, args.validation_split, args.seed)
+
+    loaded_game_count = len(unique_game_indices(all_records))
+    training_game_count = len(unique_game_indices(training_records))
+    validation_game_count = len(unique_game_indices(validation_records))
 
     device = resolve_device(args.device)
     effective_output_scale = args.output_scale if args.output_scale is not None else args.clip_cp
@@ -165,7 +216,8 @@ def main() -> int:
         print(
             f"epoch {epoch}: train_loss={train_loss:.6f} "
             f"validation_loss={validation_loss:.6f} "
-            f"train_records={len(training_records)} validation_records={len(validation_records)}"
+            f"train_records={len(training_records)} validation_records={len(validation_records)} "
+            f"train_games={training_game_count} validation_games={validation_game_count}"
         )
         if validation_loss <= best_validation:
             best_validation = validation_loss
@@ -177,6 +229,7 @@ def main() -> int:
         "train_loss": train_loss,
         "validation_loss": best_validation,
         "record_count": len(all_records),
+        "game_count": loaded_game_count,
         "load_stats": load_stats.to_dict(),
         "training_args": checkpoint_safe_value(vars(args)),
     }
@@ -191,6 +244,13 @@ def main() -> int:
                 "train_loss": train_loss,
                 "output_scale": effective_output_scale,
                 "record_count": len(all_records),
+                "game_count": loaded_game_count,
+                "train_record_count": len(training_records),
+                "validation_record_count": len(validation_records),
+                "train_game_count": training_game_count,
+                "validation_game_count": validation_game_count,
+                "skipped_records": load_stats.raw_records - load_stats.loaded_records,
+                "target_mode": args.target_mode,
                 "load_stats": load_stats.to_dict(),
             },
             indent=2,

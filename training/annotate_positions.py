@@ -19,6 +19,7 @@ from _uci import UciEngine, default_engine_path  # noqa: E402
 
 SCORE_RE = re.compile(r"\bscore (cp|mate) (-?\d+)")
 DEPTH_RE = re.compile(r"\bdepth (\d+)")
+NODES_RE = re.compile(r"\bnodes (\d+)")
 PV_RE = re.compile(r"\bpv (.+)$")
 BESTMOVE_RE = re.compile(r"^bestmove (\S+)")
 OPTION_RE = re.compile(r"^option name (.+?) type\b", re.IGNORECASE)
@@ -29,6 +30,7 @@ class SearchAnnotation:
     score_kind: str
     score_value: int
     depth: int
+    nodes: int
     best_move: str
     pv: str
 
@@ -48,12 +50,16 @@ def parse_annotation(lines: list[str]) -> SearchAnnotation:
     score_kind = "cp"
     score_value = 0
     depth = 0
+    nodes = 0
     pv = ""
     best_move = ""
     for line in lines:
         depth_match = DEPTH_RE.search(line)
         if depth_match:
             depth = int(depth_match.group(1))
+        nodes_match = NODES_RE.search(line)
+        if nodes_match:
+            nodes = int(nodes_match.group(1))
         score_match = SCORE_RE.search(line)
         if score_match:
             score_kind, value_text = score_match.groups()
@@ -66,7 +72,7 @@ def parse_annotation(lines: list[str]) -> SearchAnnotation:
             best_move = bestmove_match.group(1)
     if not best_move:
         raise RuntimeError(f"Missing bestmove while annotating position. Output was: {lines}")
-    return SearchAnnotation(score_kind=score_kind, score_value=score_value, depth=depth, best_move=best_move, pv=pv)
+    return SearchAnnotation(score_kind=score_kind, score_value=score_value, depth=depth, nodes=nodes, best_move=best_move, pv=pv)
 
 
 def resolve_workers(requested: int) -> int:
@@ -125,23 +131,45 @@ def configure_engine(engine: UciEngine, hash_mb: int, extra_options: list[str]) 
     engine.read_until(lambda line, _: line == "readyok")
 
 
-def annotate_record(engine: UciEngine, record: dict[str, object], depth: int, movetime: int) -> dict[str, object]:
-    fen = str(record["fen"])
+def build_go_request(depth: int | None, movetime: int | None, nodes: int | None) -> tuple[str, float]:
+    if movetime is not None and movetime > 0:
+        return f"go movetime {movetime}", max(5.0, movetime / 1000.0 + 2.0)
+    if nodes is not None and nodes > 0:
+        return f"go nodes {nodes}", max(10.0, nodes / 75000.0 + 5.0)
+    effective_depth = depth if depth is not None and depth > 0 else 6
+    return f"go depth {effective_depth}", max(5.0, effective_depth * 1.5)
+
+
+def annotate_position(
+    engine: UciEngine,
+    fen: str,
+    depth: int | None,
+    movetime: int | None,
+    nodes: int | None,
+) -> SearchAnnotation:
+    command, timeout = build_go_request(depth, movetime, nodes)
     engine.read_available()
     engine.send(f"position fen {fen}")
-    if movetime > 0:
-        engine.send(f"go movetime {movetime}")
-        timeout = max(5.0, movetime / 1000.0 + 2.0)
-    else:
-        engine.send(f"go depth {depth}")
-        timeout = max(5.0, depth * 1.5)
+    engine.send(command)
     lines = engine.read_until(lambda text, _: text.startswith("bestmove "), timeout=timeout)
-    annotation = parse_annotation(lines)
+    return parse_annotation(lines)
+
+
+def annotate_record(
+    engine: UciEngine,
+    record: dict[str, object],
+    depth: int | None,
+    movetime: int | None,
+    nodes: int | None,
+) -> dict[str, object]:
+    fen = str(record["fen"])
+    annotation = annotate_position(engine, fen, depth, movetime, nodes)
     annotated = dict(record)
     annotated["score_kind"] = annotation.score_kind
     annotated["score_value"] = annotation.score_value
     annotated["score_cp"] = annotation.score_value if annotation.score_kind == "cp" else None
     annotated["annotated_depth"] = annotation.depth
+    annotated["annotated_nodes"] = annotation.nodes if annotation.nodes > 0 else (nodes if nodes is not None and nodes > 0 else None)
     annotated["best_move"] = annotation.best_move
     annotated["pv"] = annotation.pv
     return annotated
@@ -151,14 +179,15 @@ def annotate_chunk(
     records: list[tuple[int, dict[str, object]]],
     engine_path: str,
     hash_mb: int,
-    depth: int,
-    movetime: int,
+    depth: int | None,
+    movetime: int | None,
+    nodes: int | None,
     extra_options: list[str],
 ) -> list[tuple[int, dict[str, object]]]:
     engine = UciEngine(Path(engine_path))
     try:
         configure_engine(engine, hash_mb, extra_options)
-        return [(index, annotate_record(engine, record, depth, movetime)) for index, record in records]
+        return [(index, annotate_record(engine, record, depth, movetime, nodes)) for index, record in records]
     finally:
         engine.quit()
 
@@ -173,8 +202,10 @@ def main() -> int:
         default=Path(__file__).resolve().parent / "output" / "positions_annotated.jsonl",
         help="Output JSONL path.",
     )
-    parser.add_argument("--depth", type=int, default=6, help="Search depth.")
-    parser.add_argument("--movetime", type=int, default=0, help="Optional fixed movetime instead of depth.")
+    budget_group = parser.add_mutually_exclusive_group()
+    budget_group.add_argument("--depth", type=int, default=None, help="Search depth.")
+    budget_group.add_argument("--movetime", type=int, default=None, help="Fixed movetime instead of depth.")
+    budget_group.add_argument("--nodes", type=int, default=None, help="Fixed node budget instead of depth.")
     parser.add_argument("--hash", type=int, default=64, help="Hash size in MB.")
     parser.add_argument("--limit", type=int, default=0, help="Optional maximum number of positions to annotate.")
     parser.add_argument(
@@ -190,6 +221,14 @@ def main() -> int:
         help="Number of parallel engine workers. Use 0 for auto based on CPU count.",
     )
     args = parser.parse_args()
+    if args.depth is None and args.movetime is None and args.nodes is None:
+        args.depth = 6
+    if args.depth is not None and args.depth <= 0:
+        parser.error("--depth must be positive.")
+    if args.movetime is not None and args.movetime <= 0:
+        parser.error("--movetime must be positive.")
+    if args.nodes is not None and args.nodes <= 0:
+        parser.error("--nodes must be positive.")
 
     engine_path = args.engine.resolve()
     input_path = args.input.resolve()
@@ -220,6 +259,7 @@ def main() -> int:
             args.hash,
             args.depth,
             args.movetime,
+            args.nodes,
             args.option,
         )
     else:
@@ -231,7 +271,16 @@ def main() -> int:
         completed = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [
-                executor.submit(annotate_chunk, chunk, str(engine_path), args.hash, args.depth, args.movetime, args.option)
+                executor.submit(
+                    annotate_chunk,
+                    chunk,
+                    str(engine_path),
+                    args.hash,
+                    args.depth,
+                    args.movetime,
+                    args.nodes,
+                    args.option,
+                )
                 for chunk in chunks
                 if chunk
             ]
