@@ -8,6 +8,9 @@ build/
 __pycache__/
 *.pyc
 .tmp_pydeps/
+.gui_pydeps/
+.wheelhouse/
+vendor/chess-1.11.2/
 
 training/checkpoints/
 training/output/

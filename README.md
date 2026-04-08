@@ -11,6 +11,7 @@ The browser/WebAssembly path has been intentionally removed so the active codeba
 - Classical tapered evaluation with material, piece-square terms, mobility, king safety, pawn structure, passed pawns, bishop pair, rook file bonuses, simplification, and tempo
 - Engine-side float32 `DFNNUE1` inference with search-local accumulators, plus safe fallback to classical eval when no network is loaded
 - Minimal UCI support for `uci`, `isready`, `ucinewgame`, `position`, `go depth`, `go movetime`, `go wtime/btime/winc/binc/movestogo`, `go infinite`, `stop`, `quit`, and engine options
+- Windows-first Tkinter UCI GUI with play mode, live analysis, FEN tools, and dynamic UCI option editing
 - Bundled Polyglot opening-book support through `data/book.bin`
 - Syzygy probing through vendored [Fathom](./third_party/fathom/README.md) with external tablebase files
 - Native CLI commands for `play`, `search`, `perft`, `legal`, `status`, `fen`, and `bench`
@@ -21,6 +22,7 @@ The browser/WebAssembly path has been intentionally removed so the active codeba
 - `engine/`: core chess engine, search, and evaluation
 - `cli/`: native CLI and UCI entrypoint
 - `data/`: bundled runtime assets and example gauntlet configuration
+- `gui/`: Tkinter UCI GUI, controller, and protocol client
 - `tests/`: native correctness and search regression tests
 - `third_party/fathom/`: vendored Syzygy probing backend
 - `scripts/`: build helpers, UCI smoke tests, bench tools, and gauntlet wrappers
@@ -30,6 +32,7 @@ The browser/WebAssembly path has been intentionally removed so the active codeba
 
 - Native build: `clang++` with C++20 support
 - Scripted smoke and workflow helpers: Python 3
+- Optional GUI runtime: `python-chess` via `gui/requirements.txt`
 - Optional match tooling: `cutechess-cli`
 - Optional NNUE training pipeline: PyTorch, NumPy, and `python-chess` via `training/requirements.txt`
 
@@ -57,6 +60,36 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_native.ps1 -Target All
 ```
 
 The native target emits `build/deadfish_native.exe` and `build/deadfish_tests_native.exe` with CPU-targeted compiler flags for local profiling and strength work.
+
+## GUI
+
+Install the lightweight GUI dependency set:
+
+```powershell
+python -m pip install -r .\gui\requirements.txt
+```
+
+Launch the desktop GUI:
+
+```powershell
+python -m gui
+python -m gui --engine path\to\other-uci-engine.exe
+```
+
+The GUI defaults to `build/deadfish_native.exe` when present, falls back to `build/deadfish.exe`, and can also browse to any other UCI engine executable. It supports:
+
+- click or drag piece movement with promotion prompts
+- live analysis via `go infinite`
+- human-vs-engine play with a configurable movetime
+- FEN load/copy, board flip, and reset/new-game controls
+- dynamic UCI settings for `check`, `spin`, `string`, `button`, and `combo` options
+- engine log output, including DeadFish NNUE load and fallback status messages
+
+For a controller/protocol smoke check that covers both a fake generic UCI engine and DeadFish itself:
+
+```powershell
+python .\scripts\gui_smoke.py
+```
 
 ## Recommended Workflows
 
@@ -209,6 +242,8 @@ The `eval` command is useful for NNUE debugging and parity checks. It returns th
 
 - `python .\scripts\uci_smoke.py`
   Verifies the UCI handshake, runtime options, NNUE load/unload fallback, depth search, movetime search, and `go infinite` / `stop`.
+- `python .\scripts\gui_smoke.py`
+  Verifies GUI controller flows against both a fake UCI engine and DeadFish, including dynamic options, analysis, engine replies, promotions, FEN reset, and invalid-option fallback logging.
 - `python .\scripts\bench_compare.py --engine-b path\to\other\engine.exe`
   Runs the fixed native bench suite on two executables and compares time and NPS.
 - `python .\scripts\profile_bench.py --repeat 5`
