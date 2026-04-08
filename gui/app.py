@@ -737,15 +737,31 @@ class GuiApp:
         widget.insert("1.0", text)
         widget.configure(state="disabled")
 
+    def _focused_widget(self) -> tk.Misc | None:
+        try:
+            return self.root.focus_get()
+        except (KeyError, tk.TclError):
+            return None
+
+    def _turn_text(self) -> str:
+        side = "White" if self.controller.board.turn == chess.WHITE else "Black"
+        if self.controller.search_kind == "play":
+            return f"{side} to move (engine thinking)"
+        if self.controller.play_mode and self.controller.board.turn != self.controller.human_color:
+            return f"{side} to move (waiting for engine)"
+        if not self.controller.play_mode and self.controller.board.turn != self.controller.human_color:
+            return f"{side} to move (engine replies paused)"
+        return f"{side} to move"
+
     def _refresh_ui(self) -> None:
-        focus_widget = self.root.focus_get()
+        focus_widget = self._focused_widget()
         self.status_var.set(self.controller.status_text)
         engine_name = self.controller.engine_identity.name or (
             self.controller.engine_path.name if self.controller.engine_path else "None"
         )
         engine_author = self.controller.engine_identity.author
         self.engine_summary_var.set(f"{engine_name} by {engine_author}" if engine_author else engine_name)
-        self.turn_var.set("White to move" if self.controller.board.turn == chess.WHITE else "Black to move")
+        self.turn_var.set(self._turn_text())
         self.analysis_depth_var.set(str(self.controller.analysis.depth or "-"))
         self.analysis_score_var.set(self.controller.analysis.score_text or "-")
         self.analysis_nodes_var.set(f"{self.controller.analysis.nodes:,}" if self.controller.analysis.nodes else "-")
