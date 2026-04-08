@@ -73,6 +73,7 @@ struct Move {
 struct SearchLimits {
     int max_depth = 5;
     int time_limit_ms = 0;
+    std::uint64_t max_nodes = 0;
     int white_time_ms = 0;
     int black_time_ms = 0;
     int white_increment_ms = 0;

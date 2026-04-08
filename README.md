@@ -292,6 +292,8 @@ The NNUE data and training flow lives under [`training/`](./training/README.md).
   Trains a first-pass HalfKP-style NNUE checkpoint in PyTorch.
 - `export_nnue.py`
   Exports the checkpoint to a custom DeadFish `.nnue` binary.
+- `train_selfplay_hybrid.bat`
+  Runs a full hybrid-residual self-play batch from build to quick benchmark.
 
 The native engine can now load exported `DFNNUE1` networks directly through `EvalFile` and switch them on or off through `UseNNUE`.
 
@@ -308,6 +310,27 @@ The recommended NNUE workflow is:
 9. Only after the internal gate is positive, run the external ladder.
 
 See [`training/README.md`](./training/README.md) for the exact commands and file flow.
+
+For the current hybrid branch, the simplest one-command loop is:
+
+```powershell
+.\train_selfplay_hybrid.bat
+```
+
+That defaults to `500` self-play games, a `20`-worker budget, a classical teacher at `50000` nodes, `8` epochs, and a `1+0.01` self-play time control. The batch helper turns that worker budget into `10` concurrent self-play games so it does not oversubscribe the machine with `40` engine processes. It trains a `classical_backbone + nnue_residual` candidate, exports it, runs parity, and then runs the fixed 25-game promotion gate against the current NNUE champion.
+
+If an accepted champion already exists at `training/output/deadfish_current.nnue`, later runs automatically:
+
+- use that champion as the self-play baseline
+- keep the annotation teacher classical
+- warm-start training from `training/checkpoints/deadfish_current.pt`
+- promote the new candidate into those champion slots only if it beats the current baseline in the 25-game gate
+
+You can pass `none` as the sixth argument to skip benchmarking for a pure training batch:
+
+```powershell
+.\train_selfplay_hybrid.bat 500 20 8 8 1+0.01 none
+```
 
 ## Validation
 

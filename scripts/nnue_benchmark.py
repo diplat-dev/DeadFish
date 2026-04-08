@@ -57,6 +57,11 @@ def main() -> int:
     parser.add_argument("--cutechess", default="cutechess-cli", help="cutechess-cli executable.")
     parser.add_argument("--engine", type=Path, default=preferred_engine_path(), help="Path to the DeadFish executable.")
     parser.add_argument("--eval-file", type=Path, required=True, help="Exported NNUE file for the NNUE side.")
+    parser.add_argument(
+        "--baseline-eval-file",
+        type=Path,
+        help="Optional current champion NNUE file. If omitted, the baseline side uses classical mode.",
+    )
     parser.add_argument("--mode", choices=sorted(PRESETS), default="quick", help="Benchmark preset.")
     parser.add_argument("--games", type=int, default=0, help="Optional override for the preset game count.")
     parser.add_argument("--tc", default="", help="Optional override for the preset time control.")
@@ -84,11 +89,29 @@ def main() -> int:
 
     engine_path = resolve_engine_path(args.engine)
     eval_file = args.eval_file.resolve()
+    baseline_eval_file = args.baseline_eval_file.resolve() if args.baseline_eval_file else None
     opening_file = args.opening_file.resolve()
     if not eval_file.exists():
         raise FileNotFoundError(f"NNUE file not found: {eval_file}")
+    if baseline_eval_file is not None and not baseline_eval_file.exists():
+        raise FileNotFoundError(f"Baseline NNUE file not found: {baseline_eval_file}")
     if not opening_file.exists():
         raise FileNotFoundError(f"Opening suite not found: {opening_file}")
+
+    name_a = "DeadFish-Classical"
+    option_a = [
+        f"Hash={args.hash}",
+        "OwnBook=false",
+        "UseNNUE=false",
+    ]
+    if baseline_eval_file is not None:
+        name_a = "DeadFish-Champion"
+        option_a = [
+            f"Hash={args.hash}",
+            "OwnBook=false",
+            "UseNNUE=true",
+            f"EvalFile={baseline_eval_file}",
+        ]
 
     command = [
         sys.executable,
@@ -100,15 +123,9 @@ def main() -> int:
         "--engine-b",
         str(engine_path),
         "--name-a",
-        "DeadFish-Classical",
+        name_a,
         "--name-b",
         "DeadFish-Hybrid",
-        "--option-a",
-        f"Hash={args.hash}",
-        "--option-a",
-        "OwnBook=false",
-        "--option-a",
-        "UseNNUE=false",
         "--option-b",
         f"Hash={args.hash}",
         "--option-b",
@@ -132,6 +149,8 @@ def main() -> int:
         "--opening-plies",
         str(args.opening_plies),
     ]
+    for option in option_a:
+        command.extend(["--option-a", option])
 
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.stdout:

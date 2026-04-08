@@ -423,6 +423,14 @@ void test_search(TestContext& t) {
     SearchResult clocked_result = engine.search(start, clocked);
     t.expect(!clocked_result.best_move.is_null(), "clock-based search returns a move");
     t.expect(start.is_move_legal(clocked_result.best_move), "clock-based search move is legal");
+
+    SearchLimits node_limited;
+    node_limited.max_depth = 64;
+    node_limited.max_nodes = 500;
+    SearchResult node_result = engine.search(start, node_limited);
+    t.expect(!node_result.best_move.is_null(), "node-limited search returns a move");
+    t.expect(start.is_move_legal(node_result.best_move), "node-limited search move is legal");
+    t.expect(node_result.nodes >= 1 && node_result.nodes <= 500 + 512, "node-limited search respects the node budget approximately");
     t.expect(start.evaluate_backbone_relative() + start.evaluate_positional_relative() == start.evaluate_relative(),
              "classical eval splits into backbone plus positional terms");
 

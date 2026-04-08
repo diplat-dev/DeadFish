@@ -186,6 +186,12 @@ def main() -> int:
         expect_legal(engine_path, fen, [], movetime_bestmove, "movetime search bestmove is legal")
 
         engine.send("position startpos")
+        engine.send("go nodes 500")
+        lines = engine.read_until(lambda line, _: line.startswith("bestmove "), timeout=10.0)
+        node_bestmove = parse_bestmove(lines)
+        expect_legal(engine_path, start_fen, [], node_bestmove, "node-limited search bestmove is legal")
+
+        engine.send("position startpos")
         engine.send("go infinite")
         time.sleep(0.15)
         engine.send("stop")

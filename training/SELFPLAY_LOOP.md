@@ -13,6 +13,46 @@ The idea is:
 
 This keeps the project moving forward in small safe steps instead of replacing the active net with every experiment.
 
+## One-Command Batch Helper
+
+From the repo root, you can run the whole candidate cycle with:
+
+```powershell
+.\train_selfplay_hybrid.bat
+```
+
+Default behavior:
+
+- `500` self-play games
+- `20` total engine workers
+- self-play concurrency derived from that budget as `10` games at a time
+- `20` annotation workers
+- classical teacher at `50000` nodes
+- `8` training epochs
+- self-play time control `1+0.01`
+- use `training/output/deadfish_current.nnue` as the self-play baseline if it exists
+- warm-start from `training/checkpoints/deadfish_current.pt` if it exists
+- promote the candidate into those champion slots only if it beats the current champion NNUE in the fixed 25-game gate
+- run an informational 25-game classical audit every 10 accepted promotions
+
+Override any of those with:
+
+```powershell
+.\train_selfplay_hybrid.bat [games] [workers] [teacher_nodes] [epochs] [selfplay_tc] [gate_mode]
+```
+
+Example:
+
+```powershell
+.\train_selfplay_hybrid.bat 1000 20 75000 8 2+0.02
+```
+
+Skip the benchmark gate entirely for a pure training batch:
+
+```powershell
+.\train_selfplay_hybrid.bat 500 20 50000 8 1+0.01 none
+```
+
 ## Recommended Layout
 
 Keep these as the stable "current champion" files:
@@ -28,16 +68,16 @@ For each run, write candidate artifacts under a dated run folder:
 - `training/runs/YYYYMMDD-HHMM/deadfish_candidate.pt`
 - `training/runs/YYYYMMDD-HHMM/deadfish_candidate.nnue`
 
-Do not overwrite the current champion until the candidate passes the benchmark gates.
+Do not overwrite the current champion until the candidate passes the benchmark gates. The batch helper now enforces that automatically when benchmarking is enabled.
 
 ## Baseline Choice
 
 Use one of these as the self-play engine:
 
-- classical DeadFish if NNUE is still unstable
-- the last accepted hybrid DeadFish build if it has already beaten classical
+- classical DeadFish if there is no accepted champion net yet
+- the last accepted hybrid DeadFish build if `training/output/deadfish_current.nnue` exists
 
-For the current branch, the safe baseline is still classical mode.
+For the current branch, the safe bootstrap baseline is still classical mode. Once a candidate passes the gate and is promoted, later runs automatically use that promoted net as the self-play baseline and warm-start point.
 
 ## One Full Candidate Cycle
 
@@ -62,10 +102,14 @@ python .\scripts\tactical_suite.py
 Use openings so the dataset is less narrow:
 
 ```powershell
-python .\training\generate_selfplay_pgn.py --games 5000 --concurrency 20 --opening-file .\data\nnue_openings.pgn --opening-format pgn --opening-order random --opening-plies 8 --output-pgn .\training\runs\RUN_ID\selfplay.pgn
+python .\training\generate_selfplay_pgn.py --games 5000 --concurrency 10 --opening-file .\data\nnue_openings.pgn --opening-format pgn --opening-order random --opening-plies 8 --output-pgn .\training\runs\RUN_ID\selfplay.pgn --name-a DeadFish-Classical --name-b DeadFish-Champion --option-a UseNNUE=false --option-b UseNNUE=true --option-b EvalFile=.\training\output\deadfish_current.nnue
 ```
 
-If the active baseline should stay classical during self-play, use the GUI/UCI default configuration or generate games from the classical executable/settings you trust.
+The batch helper rotates evenly across three pairing modes once a champion exists:
+
+- classical vs classical
+- classical vs champion
+- champion vs champion
 
 ### 3. Extract positions
 
@@ -73,15 +117,13 @@ If the active baseline should stay classical during self-play, use the GUI/UCI d
 python .\training\extract_positions.py --input-pgn .\training\runs\RUN_ID\selfplay.pgn --output .\training\runs\RUN_ID\positions.jsonl
 ```
 
-### 4. Annotate with the baseline teacher
+### 4. Annotate with the classical teacher
 
-For the current branch, this means your existing depth-limited DeadFish labels:
+The teacher always stays classical and uses a fixed node budget:
 
 ```powershell
-python .\training\annotate_positions.py --input .\training\runs\RUN_ID\positions.jsonl --output .\training\runs\RUN_ID\positions_annotated.jsonl --depth 8 --workers 20
+python .\training\annotate_positions.py --engine .\build\deadfish_native.exe --input .\training\runs\RUN_ID\positions.jsonl --output .\training\runs\RUN_ID\positions_annotated.jsonl --nodes 50000 --workers 20 --option UseNNUE=false
 ```
-
-If you later move to node-based labeling, prefer `--nodes` over `--depth`.
 
 ### 5. Train a candidate hybrid residual net
 
@@ -89,6 +131,12 @@ This branch adds `classical-residual` mode:
 
 ```powershell
 python .\training\train_nnue.py --input .\training\runs\RUN_ID\positions_annotated.jsonl --target-mode classical-residual --epochs 8 --output-checkpoint .\training\runs\RUN_ID\deadfish_candidate.pt
+```
+
+If the current champion checkpoint exists, warm-start from it:
+
+```powershell
+python .\training\train_nnue.py --input .\training\runs\RUN_ID\positions_annotated.jsonl --target-mode classical-residual --epochs 8 --initialize-from .\training\checkpoints\deadfish_current.pt --output-checkpoint .\training\runs\RUN_ID\deadfish_candidate.pt
 ```
 
 ### 6. Export the candidate
@@ -103,25 +151,26 @@ python .\training\export_nnue.py --checkpoint .\training\runs\RUN_ID\deadfish_ca
 python .\scripts\nnue_parity.py --checkpoint .\training\runs\RUN_ID\deadfish_candidate.pt --eval-file .\training\runs\RUN_ID\deadfish_candidate.nnue --sample-jsonl .\training\runs\RUN_ID\positions_annotated.jsonl
 ```
 
-### 8. Run the quick gate
+### 8. Run the promotion gate
 
 ```powershell
-python .\scripts\nnue_benchmark.py --cutechess cutechess-cli --engine .\build\deadfish_native.exe --eval-file .\training\runs\RUN_ID\deadfish_candidate.nnue --mode quick
+python .\scripts\nnue_benchmark.py --cutechess cutechess-cli --engine .\build\deadfish_native.exe --eval-file .\training\runs\RUN_ID\deadfish_candidate.nnue --baseline-eval-file .\training\output\deadfish_current.nnue --mode quick --games 25 --tc 1+0.01 --concurrency 2 --require-positive
 ```
 
-### 9. Run the strength gate only if quick passes
+### 9. Periodic classical audit
 
 ```powershell
-python .\scripts\nnue_benchmark.py --cutechess cutechess-cli --engine .\build\deadfish_native.exe --eval-file .\training\runs\RUN_ID\deadfish_candidate.nnue --mode strength --require-positive
+python .\scripts\nnue_benchmark.py --cutechess cutechess-cli --engine .\build\deadfish_native.exe --eval-file .\training\output\deadfish_current.nnue --mode quick --games 25 --tc 1+0.01 --concurrency 2
 ```
+
+Run that audit every 10 accepted promotions. It is informational only and does not veto a promotion.
 
 ## Promotion Rule
 
 Only promote the candidate if:
 
 - parity passes
-- quick gate is not a collapse
-- strength gate is positive
+- the 25-game candidate-vs-champion gate is positive
 
 If it passes, copy it into the "current champion" slot:
 
@@ -130,7 +179,7 @@ Copy-Item .\training\runs\RUN_ID\deadfish_candidate.pt .\training\checkpoints\de
 Copy-Item .\training\runs\RUN_ID\deadfish_candidate.nnue .\training\output\deadfish_current.nnue -Force
 ```
 
-Then use that new champion for the next round of self-play.
+Then use that new champion for the next round of self-play and warm-started training.
 
 ## Good Operating Rules
 
@@ -148,4 +197,4 @@ The current hybrid branch uses:
 
 That means the net is learning only the positional remainder, not the full score.
 
-For now, this is the right branch to keep experimenting on, but the first quick gate on the existing 1000-game depth-8 self-play labels still failed badly. So this loop should be treated as a safe experimentation framework, not as proof that the current self-play labels are already sufficient.
+For now, this is the right branch to keep experimenting on, but it should still be treated as a bounded distillation loop. Because the teacher remains classical forever, the NNUE ladder can improve incrementally while still eventually plateauing near the strength of that teacher and architecture.

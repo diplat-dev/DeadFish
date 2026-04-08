@@ -790,6 +790,12 @@ private:
                 if (!read_int(limits.max_depth)) {
                     return;
                 }
+            } else if (token == "nodes") {
+                int parsed_nodes = 0;
+                if (!read_int(parsed_nodes)) {
+                    return;
+                }
+                limits.max_nodes = static_cast<std::uint64_t>(std::max(0, parsed_nodes));
             } else if (token == "movetime") {
                 if (!read_int(limits.time_limit_ms)) {
                     return;

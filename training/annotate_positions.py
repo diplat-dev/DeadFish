@@ -192,6 +192,10 @@ def annotate_chunk(
         engine.quit()
 
 
+def progress_interval(total: int) -> int:
+    return max(1, min(100, total // 20 or 1))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Annotate JSONL training positions with scores from a UCI engine.")
     parser.add_argument("--engine", type=Path, default=default_engine_path(), help="Path to the teacher UCI engine executable.")
@@ -253,15 +257,28 @@ def main() -> int:
     print(f"Annotating {len(indexed_records)} positions with {worker_count} worker(s).")
 
     if worker_count == 1:
-        annotated_results = annotate_chunk(
-            indexed_records,
-            str(engine_path),
-            args.hash,
-            args.depth,
-            args.movetime,
-            args.nodes,
-            args.option,
-        )
+        engine = UciEngine(engine_path)
+        try:
+            configure_engine(engine, args.hash, args.option)
+            annotated_results = []
+            interval = progress_interval(len(indexed_records))
+            for completed, (index, record) in enumerate(indexed_records, start=1):
+                annotated_results.append(
+                    (
+                        index,
+                        annotate_record(
+                            engine,
+                            record,
+                            args.depth,
+                            args.movetime,
+                            args.nodes,
+                        ),
+                    )
+                )
+                if completed % interval == 0 or completed == len(indexed_records):
+                    print(f"Annotated {completed}/{len(indexed_records)} positions...")
+        finally:
+            engine.quit()
     else:
         chunks: list[list[tuple[int, dict[str, object]]]] = [[] for _ in range(worker_count)]
         for position, item in enumerate(indexed_records):
@@ -269,6 +286,7 @@ def main() -> int:
 
         annotated_results: list[tuple[int, dict[str, object]]] = []
         completed = 0
+        interval = progress_interval(len(indexed_records))
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [
                 executor.submit(
@@ -288,7 +306,8 @@ def main() -> int:
                 chunk_results = future.result()
                 annotated_results.extend(chunk_results)
                 completed += len(chunk_results)
-                print(f"Annotated {completed}/{len(indexed_records)} positions...")
+                if completed % interval == 0 or completed == len(indexed_records):
+                    print(f"Annotated {completed}/{len(indexed_records)} positions...")
 
     annotated_results.sort(key=lambda item: item[0])
 

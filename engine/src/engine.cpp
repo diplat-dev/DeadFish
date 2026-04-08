@@ -1388,6 +1388,10 @@ bool should_stop(SearchContext& context) {
         context.stop = true;
         return true;
     }
+    if (context.limits.max_nodes > 0 && context.nodes >= context.limits.max_nodes) {
+        context.stop = true;
+        return true;
+    }
     if (context.hard_time_ms > 0 && (context.nodes & 2047ULL) == 0 && elapsed_ms(context) >= context.hard_time_ms) {
         context.stop = true;
     }

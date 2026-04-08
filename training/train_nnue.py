@@ -75,6 +75,13 @@ def checkpoint_safe_value(value):
     return value
 
 
+def load_checkpoint(path: Path) -> dict[str, object]:
+    checkpoint = torch.load(path.resolve(), map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Unexpected checkpoint format: {path}")
+    return checkpoint
+
+
 def unique_game_indices(records) -> set[int]:
     return {record.game_index for record in records if record.game_index is not None}
 
@@ -140,6 +147,11 @@ def main() -> int:
     parser.add_argument("--device", default="auto", help="Training device: auto, cpu, or cuda.")
     parser.add_argument("--seed", type=int, default=1337, help="Random seed for shuffling and splits.")
     parser.add_argument(
+        "--initialize-from",
+        type=Path,
+        help="Optional checkpoint to warm-start from when continuing the current champion net.",
+    )
+    parser.add_argument(
         "--output-checkpoint",
         type=Path,
         default=Path(__file__).resolve().parent / "checkpoints" / "deadfish_nnue.pt",
@@ -192,6 +204,26 @@ def main() -> int:
         output_scale=effective_output_scale,
     )
     model = DeadFishNNUE(config).to(device)
+    initialized_from = None
+    if args.initialize_from:
+        init_path = args.initialize_from.resolve()
+        if not init_path.exists():
+            raise FileNotFoundError(f"Initialization checkpoint not found: {init_path}")
+        init_checkpoint = load_checkpoint(init_path)
+        init_config_dict = init_checkpoint.get("config")
+        if not isinstance(init_config_dict, dict):
+            raise ValueError(f"Initialization checkpoint missing config: {init_path}")
+        init_config = NetworkConfig(**init_config_dict)
+        if init_config != config:
+            raise ValueError(
+                "Initialization checkpoint config does not match requested config: "
+                f"{init_path} ({init_config}) != requested {config}"
+            )
+        state_dict = init_checkpoint.get("state_dict")
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"Initialization checkpoint missing state_dict: {init_path}")
+        model.load_state_dict(state_dict)
+        initialized_from = str(init_path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     train_loader = build_loader(training_records, args.batch_size, shuffle=True)
@@ -254,6 +286,7 @@ def main() -> int:
                 "validation_game_count": validation_game_count,
                 "skipped_records": load_stats.raw_records - load_stats.loaded_records,
                 "target_mode": args.target_mode,
+                "initialized_from": initialized_from,
                 "load_stats": load_stats.to_dict(),
             },
             indent=2,

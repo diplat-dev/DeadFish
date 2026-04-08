@@ -10,6 +10,16 @@ def default_engine_path() -> Path:
     return Path(__file__).resolve().parents[1] / "build" / "deadfish.exe"
 
 
+def parse_option_assignment(text: str) -> tuple[str, str]:
+    if "=" not in text:
+        raise ValueError(f"Engine option must use NAME=VALUE format: {text}")
+    name, value = text.split("=", 1)
+    name = name.strip()
+    if not name:
+        raise ValueError(f"Engine option must include a name: {text}")
+    return name, value.strip()
+
+
 def resolve_concurrency(requested: int, games: int) -> int:
     if requested > 0:
         return min(requested, max(1, games))
@@ -32,6 +42,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate DeadFish self-play PGNs through cutechess-cli.")
     parser.add_argument("--cutechess", default="cutechess-cli", help="cutechess-cli executable.")
     parser.add_argument("--engine", type=Path, default=default_engine_path(), help="Path to the DeadFish executable.")
+    parser.add_argument("--name-a", default="DeadFish-A", help="Display name for engine A.")
+    parser.add_argument("--name-b", default="DeadFish-B", help="Display name for engine B.")
     parser.add_argument(
         "--output-pgn",
         type=Path,
@@ -51,6 +63,24 @@ def main() -> int:
     parser.add_argument("--opening-format", default="pgn", help="Opening file format.")
     parser.add_argument("--opening-order", default="random", help="Opening order.")
     parser.add_argument("--opening-plies", type=int, default=8, help="Opening plies.")
+    parser.add_argument(
+        "--option",
+        action="append",
+        default=[],
+        help="Extra UCI option in NAME=VALUE format applied to both self-play engines.",
+    )
+    parser.add_argument(
+        "--option-a",
+        action="append",
+        default=[],
+        help="Extra UCI option in NAME=VALUE format applied only to engine A.",
+    )
+    parser.add_argument(
+        "--option-b",
+        action="append",
+        default=[],
+        help="Extra UCI option in NAME=VALUE format applied only to engine B.",
+    )
     parser.add_argument("--append", action="store_true", help="Append to an existing PGN instead of overwriting it.")
     parser.add_argument("--recover", action="store_true", help="Enable cutechess recovery/resume mode.")
     args = parser.parse_args()
@@ -66,29 +96,37 @@ def main() -> int:
     concurrency = resolve_concurrency(args.concurrency, args.games)
     print(f"Using cutechess concurrency {concurrency} for {args.games} games.")
 
-    command = [
-        args.cutechess,
-        "-engine",
-        "name=DeadFish-A",
-        f"cmd={engine_path}",
-        f"option.Hash={args.hash}",
-        "option.OwnBook=false",
-        "-engine",
-        "name=DeadFish-B",
-        f"cmd={engine_path}",
-        f"option.Hash={args.hash}",
-        "option.OwnBook=false",
-        "-each",
-        "proto=uci",
-        f"tc={args.tc}",
-        "-games",
-        str(args.games),
-        "-repeat",
-        "-concurrency",
-        str(concurrency),
-        "-pgnout",
-        str(output_pgn),
-    ]
+    shared_options: list[tuple[str, str]] = [parse_option_assignment(text) for text in args.option]
+    engine_a_options: list[tuple[str, str]] = shared_options + [parse_option_assignment(text) for text in args.option_a]
+    engine_b_options: list[tuple[str, str]] = shared_options + [parse_option_assignment(text) for text in args.option_b]
+
+    command = [args.cutechess]
+    for name, options in ((args.name_a, engine_a_options), (args.name_b, engine_b_options)):
+        command.extend(
+            [
+                "-engine",
+                f"name={name}",
+                f"cmd={engine_path}",
+                f"option.Hash={args.hash}",
+                "option.OwnBook=false",
+            ]
+        )
+        for option_name, option_value in options:
+            command.append(f"option.{option_name}={option_value}")
+    command.extend(
+        [
+            "-each",
+            "proto=uci",
+            f"tc={args.tc}",
+            "-games",
+            str(args.games),
+            "-repeat",
+            "-concurrency",
+            str(concurrency),
+            "-pgnout",
+            str(output_pgn),
+        ]
+    )
     if args.recover:
         command.append("-recover")
 

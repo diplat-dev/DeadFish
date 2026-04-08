@@ -27,6 +27,14 @@ python .\training\smoke_test.py
 5. Export a `.nnue` blob with `export_nnue.py`.
 6. Load that `.nnue` file in the engine with `EvalFile` when you want to test it.
 
+For the current hybrid branch, the easiest continual-improvement loop is the repo-root batch helper:
+
+```powershell
+.\train_selfplay_hybrid.bat
+```
+
+That command bootstraps from classical mode when no champion net exists yet. Once `training/output/deadfish_current.nnue` and `training/checkpoints/deadfish_current.pt` exist, later runs automatically use the accepted champion as the next self-play baseline and warm-start point, while keeping the annotation teacher classical.
+
 ## End-To-End Workflow
 
 ### 1. Generate self-play PGNs

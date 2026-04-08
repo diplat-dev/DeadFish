@@ -15,6 +15,7 @@ vendor/chess-*/
 training/checkpoints/
 training/output/
 training/runs/
+training/state/
 *.nnue
 *.pt
 *.pth
