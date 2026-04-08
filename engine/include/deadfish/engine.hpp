@@ -92,7 +92,7 @@ struct SearchInfo {
 
 struct EngineOptions {
     int hash_mb = 32;
-    bool use_nnue = true;
+    bool use_nnue = false;
     std::string eval_file;
     bool own_book = true;
     std::string book_path;

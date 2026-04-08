@@ -7,11 +7,17 @@ from pathlib import Path
 
 base = Path(__file__).resolve().parents[1]
 for candidate_path in (
-    base / "vendor" / "chess-1.11.2",
     base / ".gui_pydeps",
     base / ".tmp_pydeps",
 ):
     if candidate_path.exists():
+        candidate_text = str(candidate_path)
+        if candidate_text not in sys.path:
+            sys.path.insert(0, candidate_text)
+
+vendor_dir = base / "vendor"
+if vendor_dir.exists():
+    for candidate_path in sorted(vendor_dir.glob("chess-*"), reverse=True):
         candidate_text = str(candidate_path)
         if candidate_text not in sys.path:
             sys.path.insert(0, candidate_text)
@@ -83,14 +89,8 @@ def main() -> int:
         "MoveOverhead",
     }
     expect(expected_options.issubset(controller.engine_options.keys()), "DeadFish options are exposed through the controller")
-
-    applied, _ = controller.apply_option_drafts({"UseNNUE": False, "EvalFile": ""})
-    expect(applied, "controller queues DeadFish settings changes")
-    pump(
-        controller,
-        lambda: controller.engine_ready and controller.applied_option_values.get("UseNNUE") is False,
-    )
-    expect(any("classical eval" in line for line in controller.logs), "DeadFish fallback status is surfaced in logs")
+    expect(controller.applied_option_values.get("UseNNUE") is False, "DeadFish defaults to classical evaluation in the GUI controller")
+    expect(controller.engine_options["UseNNUE"].default is False, "DeadFish advertises UseNNUE=false by default")
 
     invalid_path = "Z:/deadfish-missing/invalid.nnue"
     applied, _ = controller.apply_option_drafts({"UseNNUE": True, "EvalFile": invalid_path})

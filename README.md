@@ -74,6 +74,7 @@ Launch the desktop GUI:
 ```powershell
 python -m gui
 python -m gui --engine path\to\other-uci-engine.exe
+.\quickstart.bat
 ```
 
 The GUI defaults to `build/deadfish_native.exe` when present, falls back to `build/deadfish.exe`, and can also browse to any other UCI engine executable. It supports:
@@ -90,6 +91,15 @@ For a controller/protocol smoke check that covers both a fake generic UCI engine
 ```powershell
 python .\scripts\gui_smoke.py
 ```
+
+For a one-command Windows workflow that clears generated files, rebuilds DeadFish, runs verification, installs the GUI dependency into `.gui_pydeps`, and launches the GUI:
+
+```powershell
+.\quickstart.bat
+.\quickstart.bat --no-launch
+```
+
+On Windows, you can also simply double-click [`quickstart.bat`](./quickstart.bat). It will rebuild and verify the engine, prepare the GUI runtime automatically, and then open the GUI once everything is ready.
 
 ## Recommended Workflows
 
@@ -197,10 +207,10 @@ Implemented UCI options:
 - `SyzygyProbeLimit`
 - `MoveOverhead`
 
-`UseNNUE` defaults to `true`, but NNUE is only active when you explicitly load a valid network through `EvalFile`. If `EvalFile` is empty, missing, unreadable, or invalid, DeadFish stays fully usable and falls back to the classical evaluator.
+`UseNNUE` defaults to `false`, so DeadFish starts in classical mode unless you explicitly enable NNUE and load a valid network through `EvalFile`. If `EvalFile` is empty, missing, unreadable, or invalid, DeadFish stays fully usable and falls back to the classical evaluator.
 
 Current note:
-the NNUE pipeline is still experimental, and current trained nets have been underperforming the classical evaluator in match play even when parity and loader checks pass. For normal use, classical mode is still the recommended default.
+the NNUE pipeline is still experimental, and current trained nets have been underperforming the classical evaluator in match play even when parity and loader checks pass. For normal use, classical mode is the built-in default.
 
 Example:
 
@@ -218,10 +228,10 @@ setoption name EvalFile value
 isready
 ```
 
-In a UCI GUI, the simplest safe setup is:
+In a UCI GUI, the default setup is already the safe setup:
 
-- leave `EvalFile` empty
-- set `UseNNUE` to `false`
+- `UseNNUE` starts as `false`
+- leave `EvalFile` empty unless you explicitly want NNUE
 
 ## CLI Commands
 

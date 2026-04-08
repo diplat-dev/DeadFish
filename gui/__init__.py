@@ -7,10 +7,8 @@ import sys
 from pathlib import Path
 
 
-def ensure_user_site() -> None:
-    base = Path(__file__).resolve().parents[1]
+def extend_sys_path(base: Path) -> None:
     for candidate_path in (
-        base / "vendor" / "chess-1.11.2",
         base / ".gui_pydeps",
         base / ".tmp_pydeps",
     ):
@@ -18,6 +16,18 @@ def ensure_user_site() -> None:
             candidate_text = str(candidate_path)
             if candidate_text not in sys.path:
                 sys.path.insert(0, candidate_text)
+
+    vendor_dir = base / "vendor"
+    if vendor_dir.exists():
+        for candidate_path in sorted(vendor_dir.glob("chess-*"), reverse=True):
+            candidate_text = str(candidate_path)
+            if candidate_text not in sys.path:
+                sys.path.insert(0, candidate_text)
+
+
+def ensure_user_site() -> None:
+    base = Path(__file__).resolve().parents[1]
+    extend_sys_path(base)
     candidate = site.getusersitepackages()
     if not candidate:
         return

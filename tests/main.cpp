@@ -444,6 +444,7 @@ void test_nnue_loader_and_eval(TestContext& t) {
     {
         Engine engine = make_search_engine();
         EngineOptions options = engine.options();
+        options.use_nnue = true;
         options.eval_file = valid_fixture.string();
         engine.set_options(options);
 
@@ -524,6 +525,7 @@ void test_nnue_loader_and_eval(TestContext& t) {
     {
         Engine engine = make_search_engine();
         EngineOptions options = engine.options();
+        options.use_nnue = true;
         options.eval_file = clipped_acc_fixture.string();
         engine.set_options(options);
         Position position = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");

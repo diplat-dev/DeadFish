@@ -118,6 +118,7 @@ def main() -> int:
         lines = engine.read_until(lambda line, _: line == "uciok")
         for option in ("Hash", "Clear Hash", "UseNNUE", "EvalFile", "OwnBook", "BookPath", "SyzygyPath", "SyzygyProbeLimit", "MoveOverhead"):
             expect(any(f"option name {option} " in line for line in lines), f"UCI advertises {option}")
+        expect(any("option name UseNNUE type check default false" in line for line in lines), "UseNNUE defaults to false")
         expect(any(line == "id name DeadFish" for line in lines), "UCI id name is reported")
 
         engine.send("isready")
@@ -135,6 +136,7 @@ def main() -> int:
         print("ok - readyok after option updates")
 
         engine.send(f"setoption name EvalFile value {valid_fixture}")
+        engine.send("setoption name UseNNUE value true")
         engine.send("isready")
         lines = engine.read_until(lambda line, _: line == "readyok")
         expect(any("info string Loaded NNUE from" in line for line in lines), "valid EvalFile reports successful NNUE load")

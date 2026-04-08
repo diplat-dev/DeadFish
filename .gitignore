@@ -10,7 +10,7 @@ __pycache__/
 .tmp_pydeps/
 .gui_pydeps/
 .wheelhouse/
-vendor/chess-1.11.2/
+vendor/chess-*/
 
 training/checkpoints/
 training/output/

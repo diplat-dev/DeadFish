@@ -8,11 +8,17 @@ from pathlib import Path
 
 base = Path(__file__).resolve().parents[1]
 for candidate_path in (
-    base / "vendor" / "chess-1.11.2",
     base / ".gui_pydeps",
     base / ".tmp_pydeps",
 ):
     if candidate_path.exists():
+        candidate_text = str(candidate_path)
+        if candidate_text not in sys.path:
+            sys.path.insert(0, candidate_text)
+
+vendor_dir = base / "vendor"
+if vendor_dir.exists():
+    for candidate_path in sorted(vendor_dir.glob("chess-*"), reverse=True):
         candidate_text = str(candidate_path)
         if candidate_text not in sys.path:
             sys.path.insert(0, candidate_text)
