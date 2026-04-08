@@ -240,6 +240,33 @@ std::filesystem::path write_bad_shape_nnue_fixture() {
     return path;
 }
 
+std::filesystem::path write_clipped_accumulator_nnue_fixture() {
+    const std::filesystem::path path = fixture_path("deadfish-clipped-acc.nnue");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const std::array<char, 8> magic = {'D', 'F', 'N', 'N', 'U', 'E', '1', '\0'};
+    out.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+    write_le_u32(out, kFixtureFeatureCount);
+    write_le_u32(out, 1);
+    write_le_u32(out, 1);
+    write_le_f32(out, 100.0f);
+
+    std::vector<float> feature_weights(kFixtureFeatureCount, 0.0f);
+    const int white_king = make_square(4, 0);
+    const int white_queen_d4 = make_square(3, 3);
+    feature_weights[fixture_feature_index(deadfish::Color::White, white_king, deadfish::Piece::WQueen, white_queen_d4)] = 2.5f;
+    for (float weight : feature_weights) {
+        write_le_f32(out, weight);
+    }
+
+    write_le_f32(out, 0.0f);   // acc bias
+    write_le_f32(out, 0.5f);   // hidden weight for first accumulator lane
+    write_le_f32(out, 0.0f);   // hidden weight for second accumulator lane
+    write_le_f32(out, 0.0f);   // hidden bias
+    write_le_f32(out, 1.0f);   // output weight
+    write_le_f32(out, 0.0f);   // output bias
+    return path;
+}
+
 void test_fen_round_trip(TestContext& t) {
     const std::vector<std::string> fens = {
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -403,6 +430,7 @@ void test_nnue_loader_and_eval(TestContext& t) {
     const std::filesystem::path wrong_magic_fixture = write_wrong_magic_nnue_fixture();
     const std::filesystem::path truncated_fixture = write_truncated_nnue_fixture();
     const std::filesystem::path bad_shape_fixture = write_bad_shape_nnue_fixture();
+    const std::filesystem::path clipped_acc_fixture = write_clipped_accumulator_nnue_fixture();
 
     auto cleanup = [&]() {
         std::error_code ignored;
@@ -410,6 +438,7 @@ void test_nnue_loader_and_eval(TestContext& t) {
         std::filesystem::remove(wrong_magic_fixture, ignored);
         std::filesystem::remove(truncated_fixture, ignored);
         std::filesystem::remove(bad_shape_fixture, ignored);
+        std::filesystem::remove(clipped_acc_fixture, ignored);
     };
 
     {
@@ -490,6 +519,16 @@ void test_nnue_loader_and_eval(TestContext& t) {
         t.expect(engine.nnue_status().find("NNUE inactive because UseNNUE=false") != std::string::npos,
                  "UseNNUE=false reports inactive NNUE");
         t.expect(engine.evaluate(position) == position.evaluate_relative(), "UseNNUE=false keeps classical evaluation active");
+    }
+
+    {
+        Engine engine = make_search_engine();
+        EngineOptions options = engine.options();
+        options.eval_file = clipped_acc_fixture.string();
+        engine.set_options(options);
+        Position position = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        t.expect(engine.nnue_loaded(), "clipped-accumulator NNUE fixture loads");
+        t.expect(engine.evaluate(position) == 50, "NNUE clips accumulator activations before the hidden layer");
     }
 
     cleanup();

@@ -21,3 +21,6 @@ tools/emsdk/
 .emscripten
 .emscripten_sanity
 .emscripten_cache/
+
+RUNBOOK.txt
+.tmp_stockfish/

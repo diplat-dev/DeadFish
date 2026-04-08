@@ -34,7 +34,7 @@ def main() -> int:
         dataset_path.write_text("".join(json.dumps(record) + "\n" for record in sample_records), encoding="utf-8")
 
         records = load_jsonl_records(dataset_path, clip_cp=1200.0)
-        config = NetworkConfig(accumulator_size=16, hidden_size=8, output_scale=600.0)
+        config = NetworkConfig(accumulator_size=16, hidden_size=8, output_scale=1200.0)
         model = DeadFishNNUE(config)
         loader = DataLoader(JsonlPositionDataset(records), batch_size=2, shuffle=False, collate_fn=collate_records)
         optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)

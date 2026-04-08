@@ -3,9 +3,9 @@
   "games": 20,
   "concurrency": 1,
   "tc": "8+0.08",
-  "opening_file": "",
+  "opening_file": "nnue_openings.pgn",
   "opening_format": "pgn",
-  "opening_order": "random",
+  "opening_order": "sequential",
   "opening_plies": 8,
   "engine_options": [
     "Hash=64",

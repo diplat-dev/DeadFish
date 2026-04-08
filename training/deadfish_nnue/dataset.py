@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 try:
@@ -24,31 +24,94 @@ class PositionRecord:
     raw: dict[str, object]
 
 
-def _normalized_target(record: dict[str, object], clip_cp: float) -> float:
+@dataclass(slots=True)
+class LoadStats:
+    raw_records: int = 0
+    loaded_records: int = 0
+    score_cp_records: int = 0
+    outcome_records: int = 0
+    mate_records: int = 0
+    skipped_mate_records: int = 0
+    clipped_records: int = 0
+    abs_le_25: int = 0
+    abs_le_50: int = 0
+    abs_le_100: int = 0
+    abs_le_200: int = 0
+    abs_le_400: int = 0
+    abs_le_800: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+def _bucket_score(stats: LoadStats, score_cp: float) -> None:
+    absolute = abs(score_cp)
+    if absolute <= 25:
+        stats.abs_le_25 += 1
+    if absolute <= 50:
+        stats.abs_le_50 += 1
+    if absolute <= 100:
+        stats.abs_le_100 += 1
+    if absolute <= 200:
+        stats.abs_le_200 += 1
+    if absolute <= 400:
+        stats.abs_le_400 += 1
+    if absolute <= 800:
+        stats.abs_le_800 += 1
+
+
+def _normalized_target(record: dict[str, object], clip_cp: float, stats: LoadStats | None = None) -> float:
+    score_kind = record.get("score_kind")
+    if score_kind == "mate":
+        if stats is not None:
+            stats.mate_records += 1
+        raise ValueError("mate-score records are excluded from score-supervised training by default")
     if "score_cp" in record and record["score_cp"] is not None:
         score_cp = float(record["score_cp"])
+        if stats is not None:
+            stats.score_cp_records += 1
+            _bucket_score(stats, score_cp)
+            if abs(score_cp) > clip_cp:
+                stats.clipped_records += 1
         score_cp = max(-clip_cp, min(clip_cp, score_cp))
         return score_cp / clip_cp
     if "wdl" in record and record["wdl"] is not None:
         value = float(record["wdl"])
         return max(-1.0, min(1.0, value * 2.0 - 1.0))
     if "outcome" in record and record["outcome"] is not None:
+        if stats is not None:
+            stats.outcome_records += 1
         return max(-1.0, min(1.0, float(record["outcome"])))
     raise ValueError("Record must include score_cp, wdl, or outcome.")
 
 
-def load_jsonl_records(path: Path, max_positions: int = 0, clip_cp: float = 1200.0) -> list[PositionRecord]:
+def load_jsonl_records(
+    path: Path,
+    max_positions: int = 0,
+    clip_cp: float = 1200.0,
+    stats: LoadStats | None = None,
+) -> list[PositionRecord]:
     records: list[PositionRecord] = []
     with path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
             if not line:
                 continue
+            if stats is not None:
+                stats.raw_records += 1
             raw = json.loads(line)
             fen = str(raw["fen"])
-            target = _normalized_target(raw, clip_cp)
+            try:
+                target = _normalized_target(raw, clip_cp, stats=stats)
+            except ValueError as exc:
+                if stats is not None and "mate-score records" in str(exc):
+                    stats.skipped_mate_records += 1
+                    continue
+                raise
             weight = float(raw.get("weight", 1.0))
             records.append(PositionRecord(fen=fen, target=target, weight=weight, raw=raw))
+            if stats is not None:
+                stats.loaded_records += 1
             if max_positions > 0 and len(records) >= max_positions:
                 break
     if not records:

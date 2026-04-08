@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from _uci import UciEngine, default_engine_path, legal_moves
+from _uci import UciEngine, default_engine_path, evaluate, legal_moves
 
 
 BESTMOVE_RE = re.compile(r"^bestmove\s+(\S+)")
@@ -98,6 +98,20 @@ def main() -> int:
     write_valid_nnue_fixture(valid_fixture)
     write_wrong_magic_fixture(wrong_magic_fixture)
 
+    nnue_fen = "4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1"
+    nnue_eval = evaluate(engine_path, nnue_fen, use_nnue=True, eval_file=valid_fixture)
+    expect(nnue_eval["score"] == 30, "CLI eval returns the expected NNUE score")
+    expect(nnue_eval["mode"] == "nnue", "CLI eval reports NNUE mode when a valid network is active")
+    expect(nnue_eval["nnueActive"] is True, "CLI eval marks NNUE active for a valid network")
+
+    classical_eval = evaluate(engine_path, nnue_fen, use_nnue=False, eval_file=valid_fixture)
+    expect(classical_eval["mode"] == "classical", "CLI eval respects --use-nnue false")
+    expect(classical_eval["nnueActive"] is False, "CLI eval reports NNUE inactive when disabled")
+
+    fallback_eval = evaluate(engine_path, nnue_fen, use_nnue=True, eval_file=wrong_magic_fixture)
+    expect(fallback_eval["mode"] == "classical", "CLI eval falls back to classical mode for an invalid network")
+    expect(fallback_eval["nnueLoaded"] is False, "CLI eval reports invalid NNUE loads as unloaded")
+
     engine = UciEngine(engine_path)
     try:
         engine.send("uci")
@@ -125,7 +139,6 @@ def main() -> int:
         lines = engine.read_until(lambda line, _: line == "readyok")
         expect(any("info string Loaded NNUE from" in line for line in lines), "valid EvalFile reports successful NNUE load")
 
-        nnue_fen = "4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1"
         engine.send(f"position fen {nnue_fen}")
         engine.send("go depth 1")
         lines = engine.read_until(lambda line, _: line.startswith("bestmove "))

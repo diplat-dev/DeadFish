@@ -68,10 +68,13 @@ def main() -> int:
         for option in opponent.get("options", []):
             command.extend(["--option-b", option])
         if opening_file:
+            opening_path = Path(opening_file).expanduser()
+            if not opening_path.is_absolute():
+                opening_path = (config_path.parent / opening_path).resolve()
             command.extend(
                 [
                     "--opening-file",
-                    opening_file,
+                    str(opening_path),
                     "--opening-format",
                     opening_format,
                     "--opening-order",

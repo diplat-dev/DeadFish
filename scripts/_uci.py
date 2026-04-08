@@ -17,6 +17,13 @@ def default_engine_path() -> Path:
     return repo_root() / "build" / "deadfish.exe"
 
 
+def preferred_engine_path() -> Path:
+    native = repo_root() / "build" / "deadfish_native.exe"
+    if native.exists():
+        return native
+    return default_engine_path()
+
+
 def run_cli(engine_path: Path, args: list[str]) -> str:
     result = subprocess.run(
         [str(engine_path), *args],
@@ -47,6 +54,25 @@ def apply_move(engine_path: Path, fen: str, move: str) -> str:
 
 def status(engine_path: Path, fen: str) -> dict:
     output = run_cli(engine_path, ["status", "--fen", fen, "--json"])
+    return json.loads(output)
+
+
+def evaluate(
+    engine_path: Path,
+    fen: str,
+    *,
+    moves: list[str] | None = None,
+    use_nnue: bool | None = None,
+    eval_file: Path | str | None = None,
+) -> dict:
+    args = ["eval", "--fen", fen, "--json"]
+    if moves:
+        args.extend(["--moves", ",".join(moves)])
+    if use_nnue is not None:
+        args.extend(["--use-nnue", "true" if use_nnue else "false"])
+    if eval_file is not None:
+        args.extend(["--eval-file", str(eval_file)])
+    output = run_cli(engine_path, args)
     return json.loads(output)
 
 
@@ -110,4 +136,3 @@ class UciEngine:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=2.0)
-

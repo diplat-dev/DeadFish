@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 from pathlib import Path
 
 try:
@@ -13,6 +14,16 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 
 from deadfish_nnue import export_model
 from deadfish_nnue.export import checkpoint_to_model, read_export, write_metadata_json
+
+
+def load_checkpoint(path: Path) -> dict[str, object]:
+    try:
+        return torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError as exc:
+        message = str(exc)
+        if "Weights only load failed" not in message:
+            raise
+        return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def main() -> int:
@@ -37,7 +48,7 @@ def main() -> int:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = load_checkpoint(checkpoint_path)
     model, config = checkpoint_to_model(checkpoint)
     output_path = args.output.resolve()
     metadata = export_model(output_path, model, config)

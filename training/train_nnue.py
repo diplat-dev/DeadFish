@@ -15,7 +15,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
         "Install training/requirements.txt first."
     ) from exc
 
-from deadfish_nnue import DeadFishNNUE, JsonlPositionDataset, NetworkConfig, collate_records, load_jsonl_records
+from deadfish_nnue import DeadFishNNUE, JsonlPositionDataset, LoadStats, NetworkConfig, collate_records, load_jsonl_records
 
 
 def resolve_device(name: str) -> str:
@@ -65,6 +65,16 @@ def evaluate(model: DeadFishNNUE, loader: DataLoader, device: str) -> float:
     return total_loss / max(1, total_batches)
 
 
+def checkpoint_safe_value(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): checkpoint_safe_value(inner) for key, inner in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [checkpoint_safe_value(item) for item in value]
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train a first-pass DeadFish HalfKP NNUE checkpoint.")
     parser.add_argument("--input", type=Path, required=True, help="Input JSONL dataset.")
@@ -78,7 +88,12 @@ def main() -> int:
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="AdamW weight decay.")
     parser.add_argument("--accumulator-size", type=int, default=128, help="HalfKP accumulator width.")
     parser.add_argument("--hidden-size", type=int, default=32, help="Post-accumulator hidden width.")
-    parser.add_argument("--output-scale", type=float, default=600.0, help="Centipawn scale associated with the network output.")
+    parser.add_argument(
+        "--output-scale",
+        type=float,
+        default=None,
+        help="Centipawn scale associated with the network output. Defaults to the clip-cp value.",
+    )
     parser.add_argument("--device", default="auto", help="Training device: auto, cpu, or cuda.")
     parser.add_argument("--seed", type=int, default=1337, help="Random seed for shuffling and splits.")
     parser.add_argument(
@@ -99,7 +114,8 @@ def main() -> int:
     if not input_path.exists():
         raise FileNotFoundError(f"Training dataset not found: {input_path}")
 
-    all_records = load_jsonl_records(input_path, max_positions=args.max_positions, clip_cp=args.clip_cp)
+    load_stats = LoadStats()
+    all_records = load_jsonl_records(input_path, max_positions=args.max_positions, clip_cp=args.clip_cp, stats=load_stats)
     rng = random.Random(args.seed)
     rng.shuffle(all_records)
 
@@ -115,10 +131,11 @@ def main() -> int:
         training_records = all_records[validation_size:]
 
     device = resolve_device(args.device)
+    effective_output_scale = args.output_scale if args.output_scale is not None else args.clip_cp
     config = NetworkConfig(
         accumulator_size=args.accumulator_size,
         hidden_size=args.hidden_size,
-        output_scale=args.output_scale,
+        output_scale=effective_output_scale,
     )
     model = DeadFishNNUE(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -160,12 +177,25 @@ def main() -> int:
         "train_loss": train_loss,
         "validation_loss": best_validation,
         "record_count": len(all_records),
-        "training_args": vars(args),
+        "load_stats": load_stats.to_dict(),
+        "training_args": checkpoint_safe_value(vars(args)),
     }
     output_checkpoint = args.output_checkpoint.resolve()
     output_checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, output_checkpoint)
-    print(json.dumps({"checkpoint": str(output_checkpoint), "validation_loss": best_validation}, indent=2))
+    print(
+        json.dumps(
+            {
+                "checkpoint": str(output_checkpoint),
+                "validation_loss": best_validation,
+                "train_loss": train_loss,
+                "output_scale": effective_output_scale,
+                "record_count": len(all_records),
+                "load_stats": load_stats.to_dict(),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

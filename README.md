@@ -88,7 +88,28 @@ This compares `build/deadfish.exe` and `build/deadfish_native.exe` on the fixed 
 python .\scripts\bench_compare.py --engine-b path\to\other\engine.exe
 ```
 
-### 3. Small internal engine match
+### 3. NNUE parity check
+
+Use this before benchmarking any exported net:
+
+```powershell
+python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue
+```
+
+This compares Python checkpoint inference, exported `.nnue` inference, and `deadfish eval` on the same FENs. It should pass before you trust match results.
+
+### 4. Standard NNUE gate
+
+Use this for classical-vs-NNUE checks with a fixed balanced opening suite:
+
+```powershell
+python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode quick
+python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode strength --require-positive
+```
+
+`quick` is a fast smoke gate. `strength` is the first real acceptance gate. Both use `data/nnue_openings.pgn` instead of training self-play games.
+
+### 5. Small internal engine match
 
 Use this when comparing two DeadFish builds:
 
@@ -98,7 +119,7 @@ python .\scripts\selfplay_gauntlet.py --engine-b path\to\other\deadfish.exe --mo
 
 This is a quick native regression check, not a replacement for a serious Elo run.
 
-### 4. External engine ladder
+### 6. External engine ladder
 
 Use this when comparing DeadFish against a small known ladder:
 
@@ -146,6 +167,7 @@ isready
 ## CLI Commands
 
 - `search [--fen FEN] [--depth N] [--movetime MS] [--json]`
+- `eval [--fen FEN] [--moves uci,uci,...] [--json] [--use-nnue BOOL] [--eval-file PATH]`
 - `perft [--fen FEN] --depth N [--divide]`
 - `legal [--fen FEN]`
 - `status [--fen FEN] [--moves uci,uci,...] [--json]`
@@ -155,6 +177,8 @@ isready
 
 The `status` command is useful for automation and returns JSON with side-to-move, check, mate, stalemate, draw, and legal-move counts when used with `--json`.
 
+The `eval` command is useful for NNUE debugging and parity checks. It returns the side-to-move-relative static evaluation without running search.
+
 ## Workflow Scripts
 
 - `python .\scripts\uci_smoke.py`
@@ -163,6 +187,12 @@ The `status` command is useful for automation and returns JSON with side-to-move
   Runs the fixed native bench suite on two executables and compares time and NPS.
 - `python .\scripts\profile_bench.py --repeat 5`
   Compares the generic and native-tuned DeadFish builds on the fixed bench suite and reports elapsed-time and NPS speedups.
+- `python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue`
+  Verifies that the Python checkpoint, exported `.nnue`, and engine runtime agree within a small centipawn tolerance on a fixed FEN suite plus sampled JSONL positions.
+- `python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode quick`
+  Runs the standardized classical-vs-NNUE benchmark gate with `data/nnue_openings.pgn`.
+- `python .\scripts\teacher_holdout.py --input .\training\output\positions_annotated.jsonl --eval-file .\training\output\deadfish.nnue --mode both`
+  Compares DeadFish classical and NNUE static eval against teacher `score_cp` labels on a sampled holdout set before match play.
 - `python .\scripts\tactical_suite.py`
   Runs the fixed tactical regression suite in [`data/tactical_suite.txt`](./data/tactical_suite.txt).
 - `python .\scripts\selfplay_gauntlet.py --engine-b path\to\other\engine.exe`
@@ -197,8 +227,10 @@ The recommended NNUE workflow is:
 2. Extract sampled positions to JSONL.
 3. Annotate them with DeadFish scores if you want score-driven targets.
 4. Train a checkpoint in PyTorch.
-5. Export a `.nnue` blob for future engine integration.
-6. Load the exported network in UCI with `setoption name EvalFile value ...`.
+5. Export a `.nnue` blob.
+6. Run the parity check before benchmarking.
+7. Benchmark classical vs NNUE with the fixed opening suite.
+8. Only after the internal gate is positive, run the external ladder.
 
 See [`training/README.md`](./training/README.md) for the exact commands and file flow.
 

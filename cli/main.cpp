@@ -29,6 +29,10 @@ struct CommandOptions {
     int movetime_ms = 0;
     bool json = false;
     bool divide = false;
+    bool has_use_nnue = false;
+    bool use_nnue = true;
+    bool has_eval_file = false;
+    std::string eval_file;
 };
 
 std::string json_escape(const std::string& input) {
@@ -124,6 +128,7 @@ void print_usage() {
         << "Commands:\n"
         << "  play   [--fen FEN] [--depth N] [--movetime MS]\n"
         << "  search [--fen FEN] [--depth N] [--movetime MS] [--json]\n"
+        << "  eval   [--fen FEN] [--moves uci,uci,...] [--json] [--use-nnue BOOL] [--eval-file PATH]\n"
         << "  perft  [--fen FEN] --depth N [--divide]\n"
         << "  legal  [--fen FEN]\n"
         << "  status [--fen FEN] [--moves uci,uci,...] [--json]\n"
@@ -159,6 +164,25 @@ bool parse_options(const std::vector<std::string>& args, CommandOptions& options
                 return false;
             }
             options.movetime_ms = std::atoi(args[++i].c_str());
+        } else if (arg == "--use-nnue") {
+            if (i + 1 >= args.size()) {
+                error = "--use-nnue requires a value.";
+                return false;
+            }
+            bool parsed = false;
+            if (!parse_bool(args[++i], parsed)) {
+                error = "--use-nnue requires true or false.";
+                return false;
+            }
+            options.has_use_nnue = true;
+            options.use_nnue = parsed;
+        } else if (arg == "--eval-file") {
+            if (i + 1 >= args.size()) {
+                error = "--eval-file requires a value.";
+                return false;
+            }
+            options.has_eval_file = true;
+            options.eval_file = args[++i];
         } else if (arg == "--json") {
             options.json = true;
         } else if (arg == "--divide") {
@@ -205,6 +229,21 @@ SearchLimits make_limits(const CommandOptions& options) {
     limits.max_depth = options.depth;
     limits.time_limit_ms = options.movetime_ms;
     return limits;
+}
+
+void apply_engine_overrides(const CommandOptions& options, Engine& engine) {
+    if (!options.has_use_nnue && !options.has_eval_file) {
+        return;
+    }
+
+    EngineOptions engine_options = engine.options();
+    if (options.has_use_nnue) {
+        engine_options.use_nnue = options.use_nnue;
+    }
+    if (options.has_eval_file) {
+        engine_options.eval_file = options.eval_file;
+    }
+    engine.set_options(engine_options);
 }
 
 std::string describe_result(const Position& position) {
@@ -258,6 +297,20 @@ void print_status_json(const Position& position) {
         << "}\n";
 }
 
+void print_eval_json(const Position& position, const Engine& engine, int score) {
+    const bool nnue_active = engine.options().use_nnue && engine.nnue_loaded();
+    std::cout
+        << "{"
+        << "\"fen\":\"" << json_escape(position.to_fen()) << "\","
+        << "\"score\":" << score << ","
+        << "\"scoreText\":\"" << json_escape(deadfish::score_to_string(score)) << "\","
+        << "\"mode\":\"" << (nnue_active ? "nnue" : "classical") << "\","
+        << "\"nnueLoaded\":" << (engine.nnue_loaded() ? "true" : "false") << ","
+        << "\"nnueActive\":" << (nnue_active ? "true" : "false") << ","
+        << "\"nnueStatus\":\"" << json_escape(engine.nnue_status()) << "\""
+        << "}\n";
+}
+
 int command_search(const CommandOptions& options) {
     Position position;
     if (!load_position(options, position)) {
@@ -268,6 +321,7 @@ int command_search(const CommandOptions& options) {
     }
 
     Engine engine;
+    apply_engine_overrides(options, engine);
     const SearchLimits limits = make_limits(options);
     SearchResult result = engine.search(position, limits, [&](const SearchInfo& info) {
         if (!options.json) {
@@ -296,6 +350,31 @@ int command_search(const CommandOptions& options) {
         } else if (result.used_tablebase) {
             std::cout << "source   tablebase\n";
         }
+    }
+    return 0;
+}
+
+int command_eval(const CommandOptions& options) {
+    Position position;
+    if (!load_position(options, position)) {
+        return 1;
+    }
+    if (!apply_option_moves(options, position)) {
+        return 1;
+    }
+
+    Engine engine;
+    apply_engine_overrides(options, engine);
+    const int score = engine.evaluate(position);
+    const bool nnue_active = engine.options().use_nnue && engine.nnue_loaded();
+
+    if (options.json) {
+        print_eval_json(position, engine, score);
+    } else {
+        std::cout << "score    " << deadfish::score_to_string(score) << "\n";
+        std::cout << "mode     " << (nnue_active ? "nnue" : "classical") << "\n";
+        std::cout << "loaded   " << (engine.nnue_loaded() ? "yes" : "no") << "\n";
+        std::cout << "status   " << engine.nnue_status() << "\n";
     }
     return 0;
 }
@@ -367,6 +446,7 @@ int command_status(const CommandOptions& options) {
 
 int command_bench(const CommandOptions& options) {
     Engine engine;
+    apply_engine_overrides(options, engine);
     EngineOptions bench_options = engine.options();
     bench_options.own_book = false;
     engine.set_options(bench_options);
@@ -402,6 +482,7 @@ int command_play(const CommandOptions& options) {
     }
 
     Engine engine;
+    apply_engine_overrides(options, engine);
     const deadfish::Color human = position.side_to_move();
 
     std::cout << position.pretty();
@@ -780,6 +861,9 @@ int main(int argc, char** argv) {
 
     if (command == "search") {
         return command_search(options);
+    }
+    if (command == "eval") {
+        return command_eval(options);
     }
     if (command == "perft") {
         return command_perft(options);

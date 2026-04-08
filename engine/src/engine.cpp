@@ -1065,8 +1065,10 @@ int evaluate_with_nnue_accumulators(const Position& position, const NnueNetwork&
         float sum = network.hidden_bias[static_cast<std::size_t>(hidden)];
         const std::size_t weight_offset = static_cast<std::size_t>(hidden) * static_cast<std::size_t>(input_size);
         for (int index = 0; index < network.accumulator_size; ++index) {
-            sum += first[static_cast<std::size_t>(index)] * network.hidden_weight[weight_offset + static_cast<std::size_t>(index)];
-            sum += second[static_cast<std::size_t>(index)] *
+            const float first_activated = std::clamp(first[static_cast<std::size_t>(index)], 0.0f, 1.0f);
+            const float second_activated = std::clamp(second[static_cast<std::size_t>(index)], 0.0f, 1.0f);
+            sum += first_activated * network.hidden_weight[weight_offset + static_cast<std::size_t>(index)];
+            sum += second_activated *
                 network.hidden_weight[weight_offset + static_cast<std::size_t>(network.accumulator_size + index)];
         }
         const float activated = std::clamp(sum, 0.0f, 1.0f);

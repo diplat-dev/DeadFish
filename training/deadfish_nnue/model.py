@@ -23,7 +23,7 @@ class NetworkConfig:
     feature_count: int = HALFKP_FEATURE_COUNT
     accumulator_size: int = 128
     hidden_size: int = 32
-    output_scale: float = 600.0
+    output_scale: float = 1200.0
 
 
 class DeadFishNNUE(nn.Module):
