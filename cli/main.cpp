@@ -26,6 +26,7 @@ struct CommandOptions {
     std::string fen = Position::start_position().to_fen();
     std::string moves;
     int depth = 5;
+    bool has_depth = false;
     int movetime_ms = 0;
     bool json = false;
     bool divide = false;
@@ -158,6 +159,7 @@ bool parse_options(const std::vector<std::string>& args, CommandOptions& options
                 return false;
             }
             options.depth = std::atoi(args[++i].c_str());
+            options.has_depth = true;
         } else if (arg == "--movetime") {
             if (i + 1 >= args.size()) {
                 error = "--movetime requires a value.";
@@ -226,7 +228,7 @@ bool apply_option_moves(const CommandOptions& options, Position& position) {
 
 SearchLimits make_limits(const CommandOptions& options) {
     SearchLimits limits;
-    limits.max_depth = options.depth;
+    limits.max_depth = options.has_depth ? options.depth : (options.movetime_ms > 0 ? 0 : options.depth);
     limits.time_limit_ms = options.movetime_ms;
     return limits;
 }
