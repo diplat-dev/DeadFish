@@ -423,6 +423,22 @@ void test_search(TestContext& t) {
     SearchResult clocked_result = engine.search(start, clocked);
     t.expect(!clocked_result.best_move.is_null(), "clock-based search returns a move");
     t.expect(start.is_move_legal(clocked_result.best_move), "clock-based search move is legal");
+
+    Position repeated = Position::start_position();
+    std::string repetition_error;
+    for (const std::string& move : {"g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8"}) {
+        t.expect(repeated.apply_uci_move(move, &repetition_error), "search repetition move applied: " + move);
+        t.expect(repetition_error.empty(), "search repetition move valid: " + move);
+    }
+    t.expect(repeated.hash() == start.hash(), "repetition search position matches start hash");
+    t.expect(repeated.is_draw_by_repetition(), "repetition search position is drawable");
+
+    SearchLimits shallow;
+    shallow.max_depth = 1;
+    SearchResult baseline = engine.search(start, shallow);
+    t.expect(!baseline.best_move.is_null(), "baseline root search returns a move");
+    SearchResult repeated_result = engine.search(repeated, shallow);
+    t.expect(repeated_result.score == 0, "repetition root search scores draw even with TT history");
 }
 
 void test_nnue_loader_and_eval(TestContext& t) {

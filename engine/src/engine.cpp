@@ -1840,6 +1840,12 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
         return node_result(0, false);
     }
 
+    // Repetition and fifty-move status depend on the current path, not only the board hash,
+    // so they must be resolved before probing the transposition table.
+    if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
+        return node_result(0, true);
+    }
+
     const int alpha_original = alpha;
     const std::uint64_t hash = position.hash();
     Move tt_move = Move::null();
@@ -1859,10 +1865,6 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
                 return node_result(tt_entry->score, true, tt_entry->best_move, {tt_entry->best_move});
             }
         }
-    }
-
-    if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
-        return node_result(0, true);
     }
 #ifdef DEADFISH_WITH_SYZYGY
     if (const auto tb_score = probe_tablebase_wdl(position, *context.state)) {
