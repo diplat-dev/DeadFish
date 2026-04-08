@@ -91,6 +91,12 @@ def main() -> int:
     expect(expected_options.issubset(controller.engine_options.keys()), "DeadFish options are exposed through the controller")
     expect(controller.applied_option_values.get("UseNNUE") is False, "DeadFish defaults to classical evaluation in the GUI controller")
     expect(controller.engine_options["UseNNUE"].default is False, "DeadFish advertises UseNNUE=false by default")
+    expect(controller.think_on_opponent_turn, "background thinking is enabled by default")
+    pump(controller, lambda: controller.search_kind == "ponder")
+    expect(controller.search_kind == "ponder", "controller starts background thinking on the user's turn")
+    controller.set_think_on_opponent_turn(False)
+    pump(controller, lambda: controller.search_kind == "idle" and not controller.waiting_for_stop, timeout=15.0)
+    expect(controller.search_kind == "idle", "disabling background thinking returns the controller to idle")
 
     invalid_path = "Z:/deadfish-missing/invalid.nnue"
     applied, _ = controller.apply_option_drafts({"UseNNUE": True, "EvalFile": invalid_path})
@@ -129,6 +135,9 @@ def main() -> int:
     if applied:
         pump(controller, lambda: controller.engine_ready and controller.applied_option_values.get("UseNNUE") is False)
 
+    controller.set_think_on_opponent_turn(True)
+    pump(controller, lambda: controller.search_kind == "ponder", timeout=15.0)
+    expect(controller.search_kind == "ponder", "background thinking can be re-enabled before play mode")
     controller.set_play_search_mode("depth")
     controller.set_search_depth(2)
     expect(controller.play_search_mode == "depth", "controller switches engine reply mode to depth")
@@ -149,6 +158,7 @@ def main() -> int:
     expect(len(controller.board.move_stack) >= 2, "engine reply is applied after a human move in movetime mode")
 
     controller.set_play_mode(False)
+    controller.set_think_on_opponent_turn(False)
     controller.set_analysis_enabled(False)
     ok, error = controller.load_fen("7k/P7/8/8/8/8/8/K7 w - - 0 1")
     expect(ok and not error, "controller accepts a promotion test FEN")

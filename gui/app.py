@@ -58,6 +58,7 @@ class BoardCanvas(tk.Canvas):
         self.drag_started = False
         self.press_pointer: tuple[float, float] = (0.0, 0.0)
         self.drag_pointer: tuple[float, float] = (0.0, 0.0)
+        self._last_redraw_signature: tuple[object, ...] | None = None
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_motion)
         self.bind("<ButtonRelease-1>", self._on_release)
@@ -141,6 +142,28 @@ class BoardCanvas(tk.Canvas):
                 fill=TEXT_PRIMARY if self.drag_piece.color == chess.WHITE else "#1d2430",
                 font=("Segoe UI Symbol", max(16, int(square * 0.72)), "normal"),
             )
+        self._last_redraw_signature = self._redraw_signature()
+
+    def sync_redraw(self) -> None:
+        signature = self._redraw_signature()
+        if signature != self._last_redraw_signature:
+            self.redraw()
+
+    def _redraw_signature(self) -> tuple[object, ...]:
+        controller = self.app.controller
+        return (
+            max(self.winfo_width(), 1),
+            max(self.winfo_height(), 1),
+            self.flipped,
+            controller.current_fen(),
+            controller.last_move.uci() if controller.last_move is not None else "",
+            self.selected_square,
+            self.drag_started,
+            self.drag_origin,
+            round(self.drag_pointer[0]),
+            round(self.drag_pointer[1]),
+            controller.search_kind,
+        )
 
     def _draw_coordinate(
         self,
@@ -301,6 +324,7 @@ class GuiApp:
         self.analysis_best_var = tk.StringVar(value="-")
         self.fen_var = tk.StringVar(value=self.controller.current_fen())
         self.play_mode_var = tk.BooleanVar(value=True)
+        self.think_on_opponent_turn_var = tk.BooleanVar(value=self.controller.think_on_opponent_turn)
         self.analysis_enabled_var = tk.BooleanVar(value=False)
         self.flipped_var = tk.BooleanVar(value=False)
         self.play_limit_mode_var = tk.StringVar(value=self.controller.play_search_mode)
@@ -535,6 +559,9 @@ class GuiApp:
     def _toggle_play_mode(self) -> None:
         self.controller.set_play_mode(self.play_mode_var.get())
 
+    def _toggle_think_on_opponent_turn(self) -> None:
+        self.controller.set_think_on_opponent_turn(self.think_on_opponent_turn_var.get())
+
     def _toggle_analysis(self) -> None:
         self.controller.set_analysis_enabled(self.analysis_enabled_var.get())
 
@@ -638,6 +665,17 @@ class GuiApp:
         for child in self.settings_inner.winfo_children():
             child.destroy()
         self.option_vars.clear()
+
+        gui_row = ttk.Frame(self.settings_inner, style="Panel.TFrame", padding=(0, 4, 0, 10))
+        gui_row.pack(fill="x")
+        ttk.Label(gui_row, text="GUI Behavior", style="Title.TLabel").pack(anchor="w")
+        ttk.Checkbutton(
+            gui_row,
+            text="Think On Opponent Turn",
+            variable=self.think_on_opponent_turn_var,
+            command=self._toggle_think_on_opponent_turn,
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Separator(self.settings_inner, orient="horizontal").pack(fill="x", pady=(0, 10))
 
         if not self.controller.engine_options:
             ttk.Label(
@@ -747,6 +785,8 @@ class GuiApp:
         side = "White" if self.controller.board.turn == chess.WHITE else "Black"
         if self.controller.search_kind == "play":
             return f"{side} to move (engine thinking)"
+        if self.controller.search_kind == "ponder":
+            return f"{side} to move (background thinking)"
         if self.controller.play_mode and self.controller.board.turn != self.controller.human_color:
             return f"{side} to move (waiting for engine)"
         if not self.controller.play_mode and self.controller.board.turn != self.controller.human_color:
@@ -770,6 +810,7 @@ class GuiApp:
         self.analysis_best_var.set(self.controller.analysis.best_move or "-")
         self.fen_var.set(self.controller.current_fen())
         self.play_mode_var.set(self.controller.play_mode)
+        self.think_on_opponent_turn_var.set(self.controller.think_on_opponent_turn)
         self.analysis_enabled_var.set(self.controller.analysis_enabled)
         self.play_limit_label_var.set(self._play_limit_label())
         if focus_widget is not getattr(self, "play_limit_mode_combo", None):
@@ -794,7 +835,7 @@ class GuiApp:
 
         if self.controller.settings_version != self.rendered_settings_version:
             self._rebuild_settings()
-        self.board_canvas.redraw()
+        self.board_canvas.sync_redraw()
 
     def _tick(self) -> None:
         self.controller.poll()

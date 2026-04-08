@@ -82,6 +82,7 @@ The GUI defaults to `build/deadfish_native.exe` when present, falls back to `bui
 - click or drag piece movement with promotion prompts
 - live analysis via `go infinite`
 - human-vs-engine play with a configurable movetime or depth reply limit
+- optional background thinking on your turn, enabled by default and toggleable in the GUI settings
 - FEN load/copy, board flip, and reset/new-game controls
 - dynamic UCI settings for `check`, `spin`, `string`, `button`, and `combo` options
 - engine log output, including DeadFish NNUE load and fallback status messages

@@ -64,6 +64,7 @@ class GameController:
         self.search_depth = 5
         self.play_search_mode = "movetime"
         self.play_mode = True
+        self.think_on_opponent_turn = True
         self.analysis_enabled = False
         self.human_color = chess.WHITE
         self.engine_ready = False
@@ -198,7 +199,10 @@ class GameController:
             number = int(str(value).strip())
         except (TypeError, ValueError):
             return
-        self.move_time_ms = max(1, number)
+        updated = max(1, number)
+        if updated == self.move_time_ms:
+            return
+        self.move_time_ms = updated
         self._restart_play_search_if_needed()
 
     def set_search_depth(self, value: Any) -> None:
@@ -206,12 +210,17 @@ class GameController:
             number = int(str(value).strip())
         except (TypeError, ValueError):
             return
-        self.search_depth = max(1, number)
+        updated = max(1, number)
+        if updated == self.search_depth:
+            return
+        self.search_depth = updated
         self._restart_play_search_if_needed()
 
     def set_play_search_mode(self, mode: str) -> None:
         normalized = mode.strip().casefold()
         if normalized not in {"movetime", "depth"}:
+            return
+        if normalized == self.play_search_mode:
             return
         self.play_search_mode = normalized
         self.status_text = (
@@ -220,6 +229,18 @@ class GameController:
             else "Engine reply limit set to depth."
         )
         self._restart_play_search_if_needed()
+
+    def set_think_on_opponent_turn(self, enabled: bool) -> None:
+        updated = bool(enabled)
+        if updated == self.think_on_opponent_turn:
+            return
+        self.think_on_opponent_turn = updated
+        self.status_text = (
+            "Background thinking on your turn is enabled."
+            if updated
+            else "Background thinking on your turn is disabled."
+        )
+        self._sync_search_state(force_restart=True)
 
     def press_button_option(self, name: str) -> None:
         if name not in self.engine_options or self.engine_options[name].kind != "button":
@@ -373,12 +394,12 @@ class GameController:
                 self.waiting_for_stop = False
                 if previous_search == "play":
                     self._apply_engine_move(event.bestmove)
-                elif previous_search == "analysis" and event.bestmove and event.bestmove != "0000":
+                elif previous_search in {"analysis", "ponder"} and event.bestmove and event.bestmove != "0000":
                     self.analysis.best_move = event.bestmove
-                    self.status_text = "Analysis completed."
+                    self.status_text = "Analysis completed." if previous_search == "analysis" else "Background analysis updated."
                 if self._send_pending_protocol_action():
                     continue
-                if previous_search == "play" or self.desired_search_kind is not None:
+                if previous_search in {"play", "analysis", "ponder"} or self.desired_search_kind is not None:
                     self._sync_search_state(force_restart=False)
                 continue
             if isinstance(event, ProcessExitedEvent):
@@ -440,6 +461,8 @@ class GameController:
     def _desired_search_kind(self) -> str | None:
         if self.play_mode and self.board.turn != self.human_color:
             return "play"
+        if self.play_mode and self.think_on_opponent_turn and self.board.turn == self.human_color:
+            return "ponder"
         if self.analysis_enabled:
             return "analysis"
         return None
@@ -498,6 +521,11 @@ class GameController:
             self.search_kind = "analysis"
             self.status_text = "Analyzing current position..."
             return
+        if kind == "ponder":
+            self.client.send(f"go movetime {min(self.move_time_ms, 250)}")
+            self.search_kind = "ponder"
+            self.status_text = "Thinking on your turn..."
+            return
         if self.play_search_mode == "depth":
             self.client.send(f"go depth {self.search_depth}")
             self.status_text = f"Engine thinking to depth {self.search_depth}..."
@@ -522,5 +550,7 @@ class GameController:
             return
         self.board.push(move)
         self.last_move = move
-        self.analysis = AnalysisSnapshot(best_move=bestmove)
+        self.analysis.best_move = bestmove
+        if not self.analysis.pv:
+            self.analysis.pv = bestmove
         self.status_text = f"Engine played {bestmove}."
