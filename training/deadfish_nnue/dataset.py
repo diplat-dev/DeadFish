@@ -14,6 +14,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
     ) from exc
 
 from .features import encode_fen
+from .backbone import evaluate_backbone_fen
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,7 @@ def _bucket_score(stats: LoadStats, score_cp: float) -> None:
 
 def _normalized_target(
     record: dict[str, object],
+    fen: str,
     clip_cp: float,
     *,
     target_mode: str = "score-or-outcome",
@@ -77,6 +79,8 @@ def _normalized_target(
         raise ValueError("mate-score records are excluded from score-supervised training by default")
     if "score_cp" in record and record["score_cp"] is not None:
         score_cp = float(record["score_cp"])
+        if target_mode == "classical-residual":
+            score_cp -= float(evaluate_backbone_fen(fen))
         if stats is not None:
             stats.score_cp_records += 1
             _bucket_score(stats, score_cp)
@@ -84,12 +88,12 @@ def _normalized_target(
                 stats.clipped_records += 1
         score_cp = max(-clip_cp, min(clip_cp, score_cp))
         return score_cp / clip_cp
-    if target_mode == "teacher-cp":
+    if target_mode in {"teacher-cp", "classical-residual"}:
         if stats is not None:
             stats.non_cp_records += 1
             if record.get("outcome") is not None:
                 stats.outcome_records += 1
-        raise ValueError("teacher-cp mode requires score_cp")
+        raise ValueError(f"{target_mode} mode requires score_cp")
     if "wdl" in record and record["wdl"] is not None:
         value = float(record["wdl"])
         return max(-1.0, min(1.0, value * 2.0 - 1.0))
@@ -118,14 +122,14 @@ def load_jsonl_records(
             raw = json.loads(line)
             fen = str(raw["fen"])
             try:
-                target = _normalized_target(raw, clip_cp, target_mode=target_mode, stats=stats)
+                target = _normalized_target(raw, fen, clip_cp, target_mode=target_mode, stats=stats)
             except ValueError as exc:
                 message = str(exc)
                 if "mate-score records" in message:
                     if stats is not None:
                         stats.skipped_mate_records += 1
                     continue
-                if "teacher-cp mode requires score_cp" in message:
+                if "requires score_cp" in message:
                     if stats is not None:
                         stats.skipped_non_cp_records += 1
                     continue

@@ -1426,7 +1426,7 @@ int evaluate_position(const Position& position, SearchContext& context, int ply)
             return position.evaluate_relative();
         }
     }
-    return evaluate_with_nnue_accumulators(position, *context.nnue, frame);
+    return position.evaluate_backbone_relative() + evaluate_with_nnue_accumulators(position, *context.nnue, frame);
 }
 
 Piece captured_piece_for_move(const Position& position, const Move& move) {
@@ -2087,9 +2087,24 @@ std::string Engine::nnue_status() const {
 
 int Engine::evaluate(const Position& position) const {
     if (std::shared_ptr<const NnueNetwork> network = active_nnue(*state_)) {
-        return evaluate_with_nnue_full(position, *network);
+        return position.evaluate_backbone_relative() + evaluate_with_nnue_full(position, *network);
     }
     return position.evaluate_relative();
+}
+
+int Engine::evaluate_classical(const Position& position) const {
+    return position.evaluate_relative();
+}
+
+int Engine::evaluate_backbone(const Position& position) const {
+    return position.evaluate_backbone_relative();
+}
+
+int Engine::evaluate_nnue_residual(const Position& position) const {
+    if (!state_->nnue) {
+        return 0;
+    }
+    return evaluate_with_nnue_full(position, *state_->nnue);
 }
 
 SearchResult Engine::search(const Position& root, const SearchLimits& limits, SearchCallback callback) {
@@ -3416,13 +3431,18 @@ int count_king_ring_attacks(const Position& position, int king_square, Color att
     return attacks;
 }
 
-}  // namespace
+struct ClassicalEvalBreakdown {
+    int backbone = 0;
+    int positional = 0;
+};
 
-int Position::evaluate_absolute() const {
+ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
     struct SideEval {
-        int middle = 0;
-        int endgame = 0;
+        int material_middle = 0;
+        int material_endgame = 0;
         int material = 0;
+        int positional_middle = 0;
+        int positional_endgame = 0;
         int center = 0;
         int mobility = 0;
         int king_safety = 0;
@@ -3440,9 +3460,10 @@ int Position::evaluate_absolute() const {
 
     SideEval white;
     SideEval black;
+    const auto& board = position.board();
 
     for (int square = 0; square < 64; ++square) {
-        const Piece piece = board_[square];
+        const Piece piece = board[square];
         if (piece == Piece::None) {
             continue;
         }
@@ -3450,37 +3471,37 @@ int Position::evaluate_absolute() const {
         SideEval& side = color == Color::White ? white : black;
         const PieceType type = piece_type(piece);
         side.material += kPieceValues[static_cast<std::size_t>(type)];
-        side.middle += kPieceValues[static_cast<std::size_t>(type)];
-        side.endgame += kPieceValuesEndgame[static_cast<std::size_t>(type)];
+        side.material_middle += kPieceValues[static_cast<std::size_t>(type)];
+        side.material_endgame += kPieceValuesEndgame[static_cast<std::size_t>(type)];
 
         switch (type) {
             case PieceType::Pawn:
-                side.middle += square_table_value(kPawnTable, square, color);
-                side.endgame += square_table_value(kPawnTable, square, color);
+                side.positional_middle += square_table_value(kPawnTable, square, color);
+                side.positional_endgame += square_table_value(kPawnTable, square, color);
                 side.pawn_files[square_file(square)] += 1;
                 side.pawns.push_back(square);
                 break;
             case PieceType::Knight:
-                side.middle += square_table_value(kKnightTable, square, color);
-                side.endgame += square_table_value(kKnightTable, square, color) / 2;
+                side.positional_middle += square_table_value(kKnightTable, square, color);
+                side.positional_endgame += square_table_value(kKnightTable, square, color) / 2;
                 break;
             case PieceType::Bishop:
-                side.middle += square_table_value(kBishopTable, square, color);
-                side.endgame += square_table_value(kBishopTable, square, color);
+                side.positional_middle += square_table_value(kBishopTable, square, color);
+                side.positional_endgame += square_table_value(kBishopTable, square, color);
                 side.bishops += 1;
                 break;
             case PieceType::Rook:
-                side.middle += square_table_value(kRookTable, square, color);
-                side.endgame += square_table_value(kRookTable, square, color);
+                side.positional_middle += square_table_value(kRookTable, square, color);
+                side.positional_endgame += square_table_value(kRookTable, square, color);
                 side.rooks.push_back(square);
                 break;
             case PieceType::Queen:
-                side.middle += square_table_value(kQueenTable, square, color);
-                side.endgame += square_table_value(kQueenTable, square, color);
+                side.positional_middle += square_table_value(kQueenTable, square, color);
+                side.positional_endgame += square_table_value(kQueenTable, square, color);
                 break;
             case PieceType::King:
-                side.middle += square_table_value(kKingMiddleTable, square, color);
-                side.endgame += square_table_value(kKingEndTable, square, color);
+                side.positional_middle += square_table_value(kKingMiddleTable, square, color);
+                side.positional_endgame += square_table_value(kKingEndTable, square, color);
                 side.king_square = square;
                 break;
             case PieceType::None:
@@ -3488,8 +3509,8 @@ int Position::evaluate_absolute() const {
                 break;
         }
 
-        side.mobility += count_piece_mobility(*this, square, piece) * mobility_weight(type);
-        side.center += count_center_control(*this, square, piece);
+        side.mobility += count_piece_mobility(position, square, piece) * mobility_weight(type);
+        side.center += count_center_control(position, square, piece);
     }
 
     if (white.bishops >= 2) {
@@ -3519,14 +3540,14 @@ int Position::evaluate_absolute() const {
                 }
                 if (color == Color::White) {
                     for (int scan_rank = rank + 1; scan_rank < 8; ++scan_rank) {
-                        if (board_[make_square(scan_file, scan_rank)] == Piece::BPawn) {
+                        if (board[make_square(scan_file, scan_rank)] == Piece::BPawn) {
                             passed = false;
                             break;
                         }
                     }
                 } else {
                     for (int scan_rank = rank - 1; scan_rank >= 0; --scan_rank) {
-                        if (board_[make_square(scan_file, scan_rank)] == Piece::WPawn) {
+                        if (board[make_square(scan_file, scan_rank)] == Piece::WPawn) {
                             passed = false;
                             break;
                         }
@@ -3581,12 +3602,12 @@ int Position::evaluate_absolute() const {
             if (shield_rank < 0 || shield_rank >= 8 || shield_file < 0 || shield_file >= 8) {
                 continue;
             }
-            if (board_[make_square(shield_file, shield_rank)] == make_piece(color, PieceType::Pawn)) {
+            if (board[make_square(shield_file, shield_rank)] == make_piece(color, PieceType::Pawn)) {
                 side.king_safety += 10;
             }
         }
-        side.king_safety -= count_king_ring_attacks(*this, side.king_square, opposite(color)) * 12;
-        if (enemy.material > side.material && phase_value(*this) > 10) {
+        side.king_safety -= count_king_ring_attacks(position, side.king_square, opposite(color)) * 12;
+        if (enemy.material > side.material && phase_value(position) > 10) {
             side.king_safety -= 10;
         }
     };
@@ -3594,7 +3615,7 @@ int Position::evaluate_absolute() const {
     evaluate_king(Color::White, white, black);
     evaluate_king(Color::Black, black, white);
 
-    const int phase = phase_value(*this);
+    const int phase = phase_value(position);
     if (phase <= 10) {
         const int white_edge = white.material - black.material;
         const int black_edge = black.material - white.material;
@@ -3606,23 +3627,54 @@ int Position::evaluate_absolute() const {
         }
     }
 
-    const int white_tapered = (white.middle * phase + white.endgame * (24 - phase)) / 24;
-    const int black_tapered = (black.middle * phase + black.endgame * (24 - phase)) / 24;
-    int score = white_tapered - black_tapered;
-    score += white.mobility - black.mobility;
-    score += white.center - black.center;
-    score += white.king_safety - black.king_safety;
-    score += white.pawn_structure - black.pawn_structure;
-    score += white.passed_pawns - black.passed_pawns;
-    score += white.rook_files - black.rook_files;
-    score += white.bishop_pair - black.bishop_pair;
-    score += white.simplification - black.simplification;
-    score += side_to_move_ == Color::White ? 10 : -10;
-    return score;
+    const int white_backbone_tapered = (white.material_middle * phase + white.material_endgame * (24 - phase)) / 24;
+    const int black_backbone_tapered = (black.material_middle * phase + black.material_endgame * (24 - phase)) / 24;
+    const int white_positional_tapered = (white.positional_middle * phase + white.positional_endgame * (24 - phase)) / 24;
+    const int black_positional_tapered = (black.positional_middle * phase + black.positional_endgame * (24 - phase)) / 24;
+
+    ClassicalEvalBreakdown breakdown;
+    breakdown.backbone = white_backbone_tapered - black_backbone_tapered;
+    breakdown.backbone += white.simplification - black.simplification;
+    breakdown.backbone += position.side_to_move() == Color::White ? 10 : -10;
+
+    breakdown.positional = white_positional_tapered - black_positional_tapered;
+    breakdown.positional += white.mobility - black.mobility;
+    breakdown.positional += white.center - black.center;
+    breakdown.positional += white.king_safety - black.king_safety;
+    breakdown.positional += white.pawn_structure - black.pawn_structure;
+    breakdown.positional += white.passed_pawns - black.passed_pawns;
+    breakdown.positional += white.rook_files - black.rook_files;
+    breakdown.positional += white.bishop_pair - black.bishop_pair;
+    return breakdown;
+}
+
+}  // namespace
+
+int Position::evaluate_absolute() const {
+    const ClassicalEvalBreakdown breakdown = evaluate_classical_breakdown(*this);
+    return breakdown.backbone + breakdown.positional;
 }
 
 int Position::evaluate_relative() const {
     const int absolute = evaluate_absolute();
+    return side_to_move_ == Color::White ? absolute : -absolute;
+}
+
+int Position::evaluate_backbone_absolute() const {
+    return evaluate_classical_breakdown(*this).backbone;
+}
+
+int Position::evaluate_backbone_relative() const {
+    const int absolute = evaluate_backbone_absolute();
+    return side_to_move_ == Color::White ? absolute : -absolute;
+}
+
+int Position::evaluate_positional_absolute() const {
+    return evaluate_classical_breakdown(*this).positional;
+}
+
+int Position::evaluate_positional_relative() const {
+    const int absolute = evaluate_positional_absolute();
     return side_to_move_ == Color::White ? absolute : -absolute;
 }
 

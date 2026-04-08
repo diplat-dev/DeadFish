@@ -118,9 +118,12 @@ def main() -> int:
     parser.add_argument("--validation-split", type=float, default=0.05, help="Validation split when no separate file is provided.")
     parser.add_argument(
         "--target-mode",
-        choices=("score-or-outcome", "teacher-cp"),
+        choices=("score-or-outcome", "teacher-cp", "classical-residual"),
         default="score-or-outcome",
-        help="Training target mode. teacher-cp requires score_cp labels and skips mate/outcome-only records.",
+        help=(
+            "Training target mode. teacher-cp requires score_cp labels and skips mate/outcome-only records. "
+            "classical-residual trains the net to predict teacher_cp minus DeadFish's classical backbone."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=256, help="Training batch size.")
     parser.add_argument("--epochs", type=int, default=4, help="Number of training epochs.")

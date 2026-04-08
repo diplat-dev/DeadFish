@@ -22,7 +22,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 
 from _uci import evaluate as engine_evaluate  # noqa: E402
 from _uci import preferred_engine_path  # noqa: E402
-from deadfish_nnue import encode_fen, read_export  # noqa: E402
+from deadfish_nnue import encode_fen, evaluate_backbone_fen, read_export  # noqa: E402
 from deadfish_nnue.export import checkpoint_to_model  # noqa: E402
 from export_nnue import load_checkpoint  # noqa: E402
 
@@ -174,8 +174,9 @@ def main() -> int:
     failures = 0
     max_diff = 0
     for index, fen in enumerate(deduped_fens, start=1):
-        checkpoint_cp = checkpoint_score(model, fen)
-        export_cp = export_score(metadata, tensors, fen)
+        backbone_cp = evaluate_backbone_fen(fen)
+        checkpoint_cp = checkpoint_score(model, fen) + backbone_cp
+        export_cp = export_score(metadata, tensors, fen) + backbone_cp
         engine_report = engine_evaluate(engine_path, fen, use_nnue=True, eval_file=eval_file)
         engine_cp = int(engine_report["score"])
 
@@ -192,7 +193,7 @@ def main() -> int:
 
         print(
             f"{index:02d} {status} "
-            f"checkpoint={checkpoint_cp:>6} export={export_cp:>6} engine={engine_cp:>6} "
+            f"checkpoint={checkpoint_cp:>6} export={export_cp:>6} engine={engine_cp:>6} backbone={backbone_cp:>6} "
             f"maxDiff={worst:>2} fen={fen}"
         )
 

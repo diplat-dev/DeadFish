@@ -53,7 +53,7 @@ def parse_score(output: str) -> tuple[str, str, float, float, float]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the standardized DeadFish classical-vs-NNUE benchmark gate.")
+    parser = argparse.ArgumentParser(description="Run the standardized DeadFish classical-vs-hybrid benchmark gate.")
     parser.add_argument("--cutechess", default="cutechess-cli", help="cutechess-cli executable.")
     parser.add_argument("--engine", type=Path, default=preferred_engine_path(), help="Path to the DeadFish executable.")
     parser.add_argument("--eval-file", type=Path, required=True, help="Exported NNUE file for the NNUE side.")
@@ -102,7 +102,7 @@ def main() -> int:
         "--name-a",
         "DeadFish-Classical",
         "--name-b",
-        "DeadFish-NNUE",
+        "DeadFish-Hybrid",
         "--option-a",
         f"Hash={args.hash}",
         "--option-a",

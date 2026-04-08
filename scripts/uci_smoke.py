@@ -100,8 +100,10 @@ def main() -> int:
 
     nnue_fen = "4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1"
     nnue_eval = evaluate(engine_path, nnue_fen, use_nnue=True, eval_file=valid_fixture)
-    expect(nnue_eval["score"] == 30, "CLI eval returns the expected NNUE score")
-    expect(nnue_eval["mode"] == "nnue", "CLI eval reports NNUE mode when a valid network is active")
+    expect(nnue_eval["nnueResidualScore"] == 30, "CLI eval returns the expected NNUE residual score")
+    expect(nnue_eval["score"] == nnue_eval["classicalBackboneScore"] + nnue_eval["nnueResidualScore"],
+           "CLI eval combines backbone and NNUE residual into the final score")
+    expect(nnue_eval["mode"] == "hybrid", "CLI eval reports hybrid mode when a valid network is active")
     expect(nnue_eval["nnueActive"] is True, "CLI eval marks NNUE active for a valid network")
 
     classical_eval = evaluate(engine_path, nnue_fen, use_nnue=False, eval_file=valid_fixture)

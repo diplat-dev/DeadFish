@@ -172,6 +172,10 @@ public:
 
     int evaluate_absolute() const;
     int evaluate_relative() const;
+    int evaluate_backbone_absolute() const;
+    int evaluate_backbone_relative() const;
+    int evaluate_positional_absolute() const;
+    int evaluate_positional_relative() const;
     Bitboard occupancy() const;
     Bitboard occupancy(Color color) const;
     Bitboard piece_bitboard(Piece piece) const;
@@ -227,6 +231,9 @@ public:
     bool nnue_loaded() const;
     std::string nnue_status() const;
     int evaluate(const Position& position) const;
+    int evaluate_classical(const Position& position) const;
+    int evaluate_backbone(const Position& position) const;
+    int evaluate_nnue_residual(const Position& position) const;
 
     SearchResult search(const Position& root, const SearchLimits& limits, SearchCallback callback = {});
     std::uint64_t perft(const Position& root, int depth);

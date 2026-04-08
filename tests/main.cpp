@@ -423,6 +423,8 @@ void test_search(TestContext& t) {
     SearchResult clocked_result = engine.search(start, clocked);
     t.expect(!clocked_result.best_move.is_null(), "clock-based search returns a move");
     t.expect(start.is_move_legal(clocked_result.best_move), "clock-based search move is legal");
+    t.expect(start.evaluate_backbone_relative() + start.evaluate_positional_relative() == start.evaluate_relative(),
+             "classical eval splits into backbone plus positional terms");
 
     Position repeated = Position::start_position();
     std::string repetition_error;
@@ -472,10 +474,12 @@ void test_nnue_loader_and_eval(TestContext& t) {
         Position black_advantage = Position::from_fen("4k3/8/8/3q4/8/8/8/4K3 w - - 0 1");
         Position balanced = Position::from_fen("4k3/8/8/3q4/3Q4/8/8/4K3 w - - 0 1");
 
-        t.expect(engine.evaluate(white_advantage) == 30, "NNUE evaluates white queen fixture as +30");
-        t.expect(engine.evaluate(white_advantage_black_to_move) == -30, "NNUE flips score by side to move");
-        t.expect(engine.evaluate(black_advantage) == -30, "NNUE evaluates black queen fixture as -30");
-        t.expect(engine.evaluate(balanced) == 0, "NNUE evaluates balanced fixture as 0");
+        t.expect(engine.evaluate_nnue_residual(white_advantage) == 30, "NNUE residual evaluates white queen fixture as +30");
+        t.expect(engine.evaluate_nnue_residual(white_advantage_black_to_move) == -30, "NNUE residual flips score by side to move");
+        t.expect(engine.evaluate_nnue_residual(black_advantage) == -30, "NNUE residual evaluates black queen fixture as -30");
+        t.expect(engine.evaluate_nnue_residual(balanced) == 0, "NNUE residual evaluates balanced fixture as 0");
+        t.expect(engine.evaluate(white_advantage) == engine.evaluate_backbone(white_advantage) + 30,
+                 "hybrid eval adds NNUE residual to the classical backbone");
 
         SearchLimits limits;
         limits.max_depth = 2;
@@ -546,7 +550,9 @@ void test_nnue_loader_and_eval(TestContext& t) {
         engine.set_options(options);
         Position position = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
         t.expect(engine.nnue_loaded(), "clipped-accumulator NNUE fixture loads");
-        t.expect(engine.evaluate(position) == 50, "NNUE clips accumulator activations before the hidden layer");
+        t.expect(engine.evaluate_nnue_residual(position) == 50, "NNUE clips accumulator activations before the hidden layer");
+        t.expect(engine.evaluate(position) == engine.evaluate_backbone(position) + 50,
+                 "hybrid eval uses the clipped NNUE residual");
     }
 
     cleanup();

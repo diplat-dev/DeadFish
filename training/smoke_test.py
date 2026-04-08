@@ -18,7 +18,16 @@ def main() -> int:
     import torch
     from torch.utils.data import DataLoader
 
-    from deadfish_nnue import DeadFishNNUE, JsonlPositionDataset, LoadStats, NetworkConfig, collate_records, export_model, load_jsonl_records
+    from deadfish_nnue import (
+        DeadFishNNUE,
+        JsonlPositionDataset,
+        LoadStats,
+        NetworkConfig,
+        collate_records,
+        evaluate_backbone_fen,
+        export_model,
+        load_jsonl_records,
+    )
     from deadfish_nnue.export import read_export
     from train_nnue import split_records_by_game
 
@@ -50,6 +59,12 @@ def main() -> int:
         assert training_games.isdisjoint(validation_games)
         assert training_games
         assert validation_games
+
+        residual_stats = LoadStats()
+        residual_records = load_jsonl_records(dataset_path, clip_cp=1200.0, target_mode="classical-residual", stats=residual_stats)
+        assert len(residual_records) == 4
+        expected_residual = (30.0 - evaluate_backbone_fen(sample_records[0]["fen"])) / 1200.0
+        assert abs(residual_records[0].target - expected_residual) < 1e-6
 
         config = NetworkConfig(accumulator_size=16, hidden_size=8, output_scale=1200.0)
         model = DeadFishNNUE(config)

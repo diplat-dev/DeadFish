@@ -299,14 +299,26 @@ void print_status_json(const Position& position) {
         << "}\n";
 }
 
-void print_eval_json(const Position& position, const Engine& engine, int score) {
+void print_eval_json(
+    const Position& position,
+    const Engine& engine,
+    int score,
+    int classical_score,
+    int backbone_score,
+    int positional_score,
+    int nnue_residual_score
+) {
     const bool nnue_active = engine.options().use_nnue && engine.nnue_loaded();
     std::cout
         << "{"
         << "\"fen\":\"" << json_escape(position.to_fen()) << "\","
         << "\"score\":" << score << ","
         << "\"scoreText\":\"" << json_escape(deadfish::score_to_string(score)) << "\","
-        << "\"mode\":\"" << (nnue_active ? "nnue" : "classical") << "\","
+        << "\"mode\":\"" << (nnue_active ? "hybrid" : "classical") << "\","
+        << "\"classicalFullScore\":" << classical_score << ","
+        << "\"classicalBackboneScore\":" << backbone_score << ","
+        << "\"classicalPositionalScore\":" << positional_score << ","
+        << "\"nnueResidualScore\":" << nnue_residual_score << ","
         << "\"nnueLoaded\":" << (engine.nnue_loaded() ? "true" : "false") << ","
         << "\"nnueActive\":" << (nnue_active ? "true" : "false") << ","
         << "\"nnueStatus\":\"" << json_escape(engine.nnue_status()) << "\""
@@ -368,13 +380,21 @@ int command_eval(const CommandOptions& options) {
     Engine engine;
     apply_engine_overrides(options, engine);
     const int score = engine.evaluate(position);
+    const int classical_score = engine.evaluate_classical(position);
+    const int backbone_score = engine.evaluate_backbone(position);
+    const int positional_score = classical_score - backbone_score;
+    const int nnue_residual_score = engine.evaluate_nnue_residual(position);
     const bool nnue_active = engine.options().use_nnue && engine.nnue_loaded();
 
     if (options.json) {
-        print_eval_json(position, engine, score);
+        print_eval_json(position, engine, score, classical_score, backbone_score, positional_score, nnue_residual_score);
     } else {
         std::cout << "score    " << deadfish::score_to_string(score) << "\n";
-        std::cout << "mode     " << (nnue_active ? "nnue" : "classical") << "\n";
+        std::cout << "mode     " << (nnue_active ? "hybrid" : "classical") << "\n";
+        std::cout << "classic  " << deadfish::score_to_string(classical_score) << "\n";
+        std::cout << "backbone " << deadfish::score_to_string(backbone_score) << "\n";
+        std::cout << "c-pos    " << deadfish::score_to_string(positional_score) << "\n";
+        std::cout << "nnue     " << deadfish::score_to_string(nnue_residual_score) << "\n";
         std::cout << "loaded   " << (engine.nnue_loaded() ? "yes" : "no") << "\n";
         std::cout << "status   " << engine.nnue_status() << "\n";
     }
