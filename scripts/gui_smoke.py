@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import site
+import struct
 import sys
 import time
 from pathlib import Path
@@ -33,7 +34,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gui.controller import GameController
-from gui.uci import discover_default_engine
+from gui.uci import discover_default_engine, discover_default_nnue
 
 
 def expect(condition: bool, label: str) -> None:
@@ -54,6 +55,53 @@ def pump(controller: GameController, predicate, timeout: float = 5.0) -> None:
 
 def label_for(predicate) -> str:
     return getattr(predicate, "__name__", repr(predicate))
+
+
+def make_square(file: int, rank: int) -> int:
+    return rank * 8 + file
+
+
+def mirror_square(square: int) -> int:
+    return square ^ 56
+
+
+def piece_bucket(piece: str, perspective: str) -> int:
+    color_offset = 0 if piece[0] == perspective else 5
+    piece_offset = {"P": 0, "N": 1, "B": 2, "R": 3, "Q": 4}[piece[1]]
+    return color_offset + piece_offset
+
+
+def orient_square(square: int, perspective: str) -> int:
+    return square if perspective == "w" else mirror_square(square)
+
+
+def feature_index(perspective: str, king_square: int, piece: str, square: int) -> int:
+    return orient_square(king_square, perspective) * (10 * 64) + piece_bucket(piece, perspective) * 64 + orient_square(square, perspective)
+
+
+def write_valid_nnue_fixture(path: Path) -> None:
+    feature_count = 64 * 10 * 64
+    accumulator_size = 1
+    hidden_size = 2
+
+    weights = [0.0] * feature_count
+    white_king = make_square(4, 0)
+    black_king = make_square(4, 7)
+    white_queen_d4 = make_square(3, 3)
+    black_queen_d5 = make_square(3, 4)
+    weights[feature_index("w", white_king, "wQ", white_queen_d4)] = 0.40
+    weights[feature_index("b", black_king, "wQ", white_queen_d4)] = 0.10
+    weights[feature_index("w", white_king, "bQ", black_queen_d5)] = 0.05
+    weights[feature_index("b", black_king, "bQ", black_queen_d5)] = 0.35
+
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<8sIIIf", b"DFNNUE1\0", feature_count, accumulator_size, hidden_size, 100.0))
+        handle.write(struct.pack(f"<{feature_count}f", *weights))
+        handle.write(struct.pack("<f", 0.0))
+        handle.write(struct.pack("<4f", 1.0, -1.0, -1.0, 1.0))
+        handle.write(struct.pack("<2f", 0.0, 0.0))
+        handle.write(struct.pack("<2f", 1.0, -1.0))
+        handle.write(struct.pack("<f", 0.0))
 
 
 def main() -> int:
@@ -97,6 +145,29 @@ def main() -> int:
     controller.set_think_on_opponent_turn(False)
     pump(controller, lambda: controller.search_kind == "idle" and not controller.waiting_for_stop, timeout=15.0)
     expect(controller.search_kind == "idle", "disabling background thinking returns the controller to idle")
+
+    champion_eval = discover_default_nnue()
+    created_champion_fixture = False
+    fallback_dir = ROOT / "training" / "output"
+    fallback_eval = fallback_dir / "deadfish_current.nnue"
+    fallback_meta = fallback_dir / "deadfish_current.nnue.json"
+    if champion_eval is None:
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        write_valid_nnue_fixture(fallback_eval)
+        fallback_meta.write_text('{"fixture":"gui-smoke"}\n', encoding="utf-8")
+        champion_eval = fallback_eval
+        created_champion_fixture = True
+
+    applied, _ = controller.apply_option_drafts({"UseNNUE": True, "EvalFile": ""})
+    expect(applied, "controller queues auto-selected champion NNUE")
+    pump(
+        controller,
+        lambda: controller.engine_ready and controller.applied_option_values.get("UseNNUE") is True,
+    )
+    expect(
+        controller.applied_option_values.get("EvalFile") == str(champion_eval.resolve()),
+        "controller auto-selects the champion NNUE when enabling NNUE with an empty path",
+    )
 
     invalid_path = "Z:/deadfish-missing/invalid.nnue"
     applied, _ = controller.apply_option_drafts({"UseNNUE": True, "EvalFile": invalid_path})
@@ -175,6 +246,9 @@ def main() -> int:
     controller.reset_position()
     expect(controller.current_fen() == chess.STARTING_FEN, "reset position restores the root position")
     controller.shutdown()
+    if created_champion_fixture:
+        fallback_eval.unlink(missing_ok=True)
+        fallback_meta.unlink(missing_ok=True)
     print("GUI smoke checks passed.")
     return 0
 

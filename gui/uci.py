@@ -23,6 +23,18 @@ def discover_default_engine(root: Path | None = None) -> Path | None:
     return None
 
 
+def discover_default_nnue(root: Path | None = None) -> Path | None:
+    base = root or repo_root()
+    candidates = (
+        base / "training" / "output" / "deadfish_current.nnue",
+        base / "training" / "output" / "deadfish.nnue",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 def normalize_option_name(name: str) -> str:
     return name.strip().casefold()
 

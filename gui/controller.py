@@ -20,6 +20,7 @@ from .uci import (
     UciOption,
     coerce_option_value,
     discover_default_engine,
+    discover_default_nnue,
     format_score,
     option_default_value,
     uci_option_value_text,
@@ -136,6 +137,9 @@ class GameController:
 
     def default_engine(self) -> Path | None:
         return discover_default_engine()
+
+    def default_nnue(self) -> Path | None:
+        return discover_default_nnue()
 
     def current_fen(self) -> str:
         return self.board.fen(en_passant="fen")
@@ -255,13 +259,26 @@ class GameController:
             return False, "No engine options are available yet."
 
         sanitized: dict[str, Any] = {}
-        changed: dict[str, Any] = {}
         for name, option in self.engine_options.items():
             if option.kind == "button":
                 continue
             raw_value = draft_values.get(name, self.draft_option_values.get(name, option_default_value(option)))
             value = coerce_option_value(option, raw_value)
             sanitized[name] = value
+
+        auto_nnue_path: Path | None = None
+        use_nnue_value = bool(sanitized.get("UseNNUE")) if "UseNNUE" in sanitized else False
+        eval_file_value = str(sanitized.get("EvalFile", "")).strip() if "EvalFile" in sanitized else ""
+        if use_nnue_value and "EvalFile" in sanitized and not eval_file_value:
+            auto_nnue_path = self.default_nnue()
+            if auto_nnue_path is not None:
+                sanitized["EvalFile"] = str(auto_nnue_path)
+
+        changed: dict[str, Any] = {}
+        for name, option in self.engine_options.items():
+            if option.kind == "button":
+                continue
+            value = sanitized[name]
             if self.applied_option_values.get(name, option_default_value(option)) != value:
                 changed[name] = value
 
@@ -270,6 +287,9 @@ class GameController:
         if not changed:
             self.status_text = "No engine setting changes to apply."
             return False, self.status_text
+
+        if auto_nnue_path is not None:
+            self.append_log(f"Auto-selected champion NNUE: {auto_nnue_path}")
 
         self.pending_option_apply = changed
         self.status_text = "Applying engine settings..."
