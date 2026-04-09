@@ -118,8 +118,9 @@ def main() -> int:
     try:
         engine.send("uci")
         lines = engine.read_until(lambda line, _: line == "uciok")
-        for option in ("Hash", "Clear Hash", "UseNNUE", "EvalFile", "OwnBook", "BookPath", "SyzygyPath", "SyzygyProbeLimit", "MoveOverhead"):
+        for option in ("Hash", "Threads", "Clear Hash", "UseNNUE", "EvalFile", "OwnBook", "BookPath", "SyzygyPath", "SyzygyProbeLimit", "MoveOverhead"):
             expect(any(f"option name {option} " in line for line in lines), f"UCI advertises {option}")
+        expect(any("option name Threads type spin default 1" in line for line in lines), "Threads defaults to 1")
         expect(any("option name UseNNUE type check default false" in line for line in lines), "UseNNUE defaults to false")
         expect(any(line == "id name DeadFish" for line in lines), "UCI id name is reported")
 
@@ -128,6 +129,7 @@ def main() -> int:
         print("ok - readyok after startup")
 
         engine.send("setoption name Hash value 64")
+        engine.send("setoption name Threads value 2")
         engine.send("setoption name OwnBook value false")
         engine.send("setoption name MoveOverhead value 15")
         engine.send("setoption name BookPath value Z:/deadfish-missing/book.bin")
@@ -198,6 +200,14 @@ def main() -> int:
         lines = engine.read_until(lambda line, _: line.startswith("bestmove "), timeout=10.0)
         infinite_bestmove = parse_bestmove(lines)
         expect_legal(engine_path, start_fen, [], infinite_bestmove, "infinite search stops with a legal bestmove")
+
+        engine.send("position startpos")
+        engine.send("go infinite")
+        time.sleep(0.10)
+        engine.send("stop")
+        lines = engine.read_until(lambda line, _: line.startswith("bestmove "), timeout=10.0)
+        second_infinite_bestmove = parse_bestmove(lines)
+        expect_legal(engine_path, start_fen, [], second_infinite_bestmove, "repeated infinite search with Threads=2 stops cleanly")
 
         print("UCI smoke checks passed.")
         return 0

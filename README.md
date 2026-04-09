@@ -7,10 +7,10 @@ The browser/WebAssembly path has been intentionally removed so the active codeba
 ## Features
 
 - Custom bitboard engine core with legal move generation, compact delta make/unmake, repetition tracking, and full Zobrist hashing
-- Iterative deepening with alpha-beta, aspiration windows, PVS, quiescence, null-move pruning, LMR, killer/history heuristics, SEE-based move handling, and a clustered fixed-size TT
+- Iterative deepening with alpha-beta, aspiration windows, PVS, quiescence, null-move pruning, LMR, killer/history heuristics, SEE-based move handling, a clustered fixed-size TT, and Lazy SMP multi-threading
 - Classical tapered evaluation with material, piece-square terms, mobility, king safety, pawn structure, passed pawns, bishop pair, rook file bonuses, simplification, and tempo
 - Engine-side float32 `DFNNUE1` inference with search-local accumulators, plus safe fallback to classical eval when no network is loaded
-- Minimal UCI support for `uci`, `isready`, `ucinewgame`, `position`, `go depth`, `go movetime`, `go wtime/btime/winc/binc/movestogo`, `go infinite`, `stop`, `quit`, and engine options
+- Minimal UCI support for `uci`, `isready`, `ucinewgame`, `position`, `go depth`, `go nodes`, `go movetime`, `go wtime/btime/winc/binc/movestogo`, `go infinite`, `stop`, `quit`, and engine options
 - Windows-first Tkinter UCI GUI with play mode, live analysis, FEN tools, and dynamic UCI option editing
 - Bundled Polyglot opening-book support through `data/book.bin`
 - Syzygy probing through vendored [Fathom](./third_party/fathom/README.md) with external tablebase files
@@ -199,6 +199,7 @@ Run `.\build\deadfish.exe` without arguments to enter the UCI loop. The engine a
 Implemented UCI options:
 
 - `Hash`
+- `Threads`
 - `Clear Hash`
 - `UseNNUE`
 - `EvalFile`
@@ -208,7 +209,7 @@ Implemented UCI options:
 - `SyzygyProbeLimit`
 - `MoveOverhead`
 
-`UseNNUE` defaults to `false`, so DeadFish starts in classical mode unless you explicitly enable NNUE and load a valid network through `EvalFile`. If `EvalFile` is empty, missing, unreadable, or invalid, DeadFish stays fully usable and falls back to the classical evaluator.
+`Threads` defaults to `1`, so DeadFish stays on the original single-threaded path unless you explicitly raise it. `UseNNUE` defaults to `false`, so DeadFish starts in classical mode unless you explicitly enable NNUE and load a valid network through `EvalFile`. If `EvalFile` is empty, missing, unreadable, or invalid, DeadFish stays fully usable and falls back to the classical evaluator.
 
 Current note:
 the NNUE pipeline is still experimental, and current trained nets have been underperforming the classical evaluator in match play even when parity and loader checks pass. For normal use, classical mode is the built-in default.
@@ -236,14 +237,14 @@ In a UCI GUI, the default setup is already the safe setup:
 
 ## CLI Commands
 
-- `search [--fen FEN] [--depth N] [--movetime MS] [--json]`
+- `search [--fen FEN] [--depth N] [--movetime MS] [--threads N] [--json]`
 - `eval [--fen FEN] [--moves uci,uci,...] [--json] [--use-nnue BOOL] [--eval-file PATH]`
 - `perft [--fen FEN] --depth N [--divide]`
 - `legal [--fen FEN]`
 - `status [--fen FEN] [--moves uci,uci,...] [--json]`
 - `fen [--fen FEN] [--moves uci,uci,...]`
-- `play [--fen FEN] [--depth N] [--movetime MS]`
-- `bench [--depth N] [--movetime MS]`
+- `play [--fen FEN] [--depth N] [--movetime MS] [--threads N]`
+- `bench [--depth N] [--movetime MS] [--threads N]`
 
 The `status` command is useful for automation and returns JSON with side-to-move, check, mate, stalemate, draw, and legal-move counts when used with `--json`.
 

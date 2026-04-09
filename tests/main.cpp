@@ -1,12 +1,14 @@
 #include "deadfish/engine.hpp"
 
 #include <bit>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -449,6 +451,53 @@ void test_search(TestContext& t) {
     t.expect(!baseline.best_move.is_null(), "baseline root search returns a move");
     SearchResult repeated_result = engine.search(repeated, shallow);
     t.expect(repeated_result.score == 0, "repetition root search scores draw even with TT history");
+
+    for (int threads : {2, 4}) {
+        Engine threaded_engine = make_search_engine();
+        EngineOptions threaded_options = threaded_engine.options();
+        threaded_options.threads = threads;
+        threaded_engine.set_options(threaded_options);
+
+        SearchLimits threaded_limits;
+        threaded_limits.max_depth = 5;
+        SearchResult threaded_result = threaded_engine.search(mate_in_one, threaded_limits);
+        t.expect(!threaded_result.best_move.is_null(), "threaded search returns a move at Threads=" + std::to_string(threads));
+        t.expect(mate_in_one.is_move_legal(threaded_result.best_move),
+                 "threaded search move is legal at Threads=" + std::to_string(threads));
+
+        SearchLimits threaded_nodes = node_limited;
+        SearchResult threaded_node_result = threaded_engine.search(start, threaded_nodes);
+        t.expect(!threaded_node_result.best_move.is_null(),
+                 "threaded node-limited search returns a move at Threads=" + std::to_string(threads));
+        t.expect(start.is_move_legal(threaded_node_result.best_move),
+                 "threaded node-limited move is legal at Threads=" + std::to_string(threads));
+        t.expect(threaded_node_result.nodes >= 1 && threaded_node_result.nodes <= 500 + 2048,
+                 "threaded node-limited search respects the global budget approximately at Threads=" + std::to_string(threads));
+    }
+
+    {
+        Engine threaded_engine = make_search_engine();
+        EngineOptions threaded_options = threaded_engine.options();
+        threaded_options.threads = 2;
+        threaded_engine.set_options(threaded_options);
+
+        for (int iteration = 0; iteration < 2; ++iteration) {
+            SearchLimits infinite;
+            infinite.infinite = true;
+            SearchResult async_result;
+            std::thread search_thread([&] {
+                async_result = threaded_engine.search(start, infinite);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            threaded_engine.request_stop();
+            search_thread.join();
+            t.expect(!async_result.best_move.is_null(),
+                     "threaded infinite search stops with a move on iteration " + std::to_string(iteration + 1));
+            t.expect(start.is_move_legal(async_result.best_move),
+                     "threaded infinite search move is legal on iteration " + std::to_string(iteration + 1));
+            threaded_engine.clear_stop_request();
+        }
+    }
 }
 
 void test_nnue_loader_and_eval(TestContext& t) {

@@ -27,6 +27,8 @@ struct CommandOptions {
     std::string moves;
     int depth = 5;
     bool has_depth = false;
+    int threads = 1;
+    bool has_threads = false;
     int movetime_ms = 0;
     bool json = false;
     bool divide = false;
@@ -127,14 +129,14 @@ void print_usage() {
         << "DeadFish\n"
         << "Run without arguments to start the UCI protocol loop.\n"
         << "Commands:\n"
-        << "  play   [--fen FEN] [--depth N] [--movetime MS]\n"
-        << "  search [--fen FEN] [--depth N] [--movetime MS] [--json]\n"
+        << "  play   [--fen FEN] [--depth N] [--movetime MS] [--threads N]\n"
+        << "  search [--fen FEN] [--depth N] [--movetime MS] [--threads N] [--json]\n"
         << "  eval   [--fen FEN] [--moves uci,uci,...] [--json] [--use-nnue BOOL] [--eval-file PATH]\n"
         << "  perft  [--fen FEN] --depth N [--divide]\n"
         << "  legal  [--fen FEN]\n"
         << "  status [--fen FEN] [--moves uci,uci,...] [--json]\n"
         << "  fen    [--fen FEN] [--moves uci,uci,...]\n"
-        << "  bench  [--depth N] [--movetime MS]\n"
+        << "  bench  [--depth N] [--movetime MS] [--threads N]\n"
         << "  uci    Start the UCI protocol loop explicitly\n";
 }
 
@@ -166,6 +168,13 @@ bool parse_options(const std::vector<std::string>& args, CommandOptions& options
                 return false;
             }
             options.movetime_ms = std::atoi(args[++i].c_str());
+        } else if (arg == "--threads") {
+            if (i + 1 >= args.size()) {
+                error = "--threads requires a value.";
+                return false;
+            }
+            options.threads = std::atoi(args[++i].c_str());
+            options.has_threads = true;
         } else if (arg == "--use-nnue") {
             if (i + 1 >= args.size()) {
                 error = "--use-nnue requires a value.";
@@ -234,7 +243,7 @@ SearchLimits make_limits(const CommandOptions& options) {
 }
 
 void apply_engine_overrides(const CommandOptions& options, Engine& engine) {
-    if (!options.has_use_nnue && !options.has_eval_file) {
+    if (!options.has_use_nnue && !options.has_eval_file && !options.has_threads) {
         return;
     }
 
@@ -244,6 +253,9 @@ void apply_engine_overrides(const CommandOptions& options, Engine& engine) {
     }
     if (options.has_eval_file) {
         engine_options.eval_file = options.eval_file;
+    }
+    if (options.has_threads) {
+        engine_options.threads = options.threads;
     }
     engine.set_options(engine_options);
 }
@@ -641,6 +653,7 @@ private:
         output_line("id name DeadFish");
         output_line("id author DeadFish contributors");
         output_line("option name Hash type spin default " + std::to_string(options.hash_mb) + " min 1 max 4096");
+        output_line("option name Threads type spin default " + std::to_string(options.threads) + " min 1 max 64");
         output_line("option name Clear Hash type button");
         output_line(std::string("option name UseNNUE type check default ") + (options.use_nnue ? "true" : "false"));
         output_line("option name EvalFile type string default <empty>");
@@ -730,6 +743,12 @@ private:
                 return;
             }
             options.hash_mb = parsed_int;
+        } else if (iequals(name, "Threads")) {
+            if (!parse_int(value, parsed_int)) {
+                output_line("info string invalid Threads value");
+                return;
+            }
+            options.threads = parsed_int;
         } else if (iequals(name, "UseNNUE")) {
             if (!parse_bool(value, parsed_bool)) {
                 output_line("info string invalid UseNNUE value");

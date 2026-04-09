@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -20,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #ifdef DEADFISH_WITH_SYZYGY
 extern "C" {
 #include "tbprobe.h"
@@ -455,13 +457,108 @@ struct TTEntry {
     Move best_move = Move::null();
 };
 
-struct TTSlot {
+constexpr int kTtDepthBits = 16;
+constexpr int kTtScoreBits = 20;
+constexpr int kTtFlagBits = 2;
+constexpr int kTtAgeBits = 8;
+constexpr int kTtMoveBits = 18;
+
+constexpr std::uint64_t kTtDepthMask = (1ULL << kTtDepthBits) - 1;
+constexpr std::uint64_t kTtScoreMask = (1ULL << kTtScoreBits) - 1;
+constexpr std::uint64_t kTtFlagMask = (1ULL << kTtFlagBits) - 1;
+constexpr std::uint64_t kTtAgeMask = (1ULL << kTtAgeBits) - 1;
+constexpr std::uint64_t kTtMoveMask = (1ULL << kTtMoveBits) - 1;
+
+constexpr int kTtScoreShift = kTtDepthBits;
+constexpr int kTtFlagShift = kTtScoreShift + kTtScoreBits;
+constexpr int kTtAgeShift = kTtFlagShift + kTtFlagBits;
+constexpr int kTtMoveShift = kTtAgeShift + kTtAgeBits;
+
+int score_to_tt(int score, int ply);
+int score_from_tt(int score, int ply);
+
+std::uint32_t encode_tt_move(const Move& move) {
+    return static_cast<std::uint32_t>(move.from)
+        | (static_cast<std::uint32_t>(move.to) << 6)
+        | (static_cast<std::uint32_t>(move.flag) << 12)
+        | (static_cast<std::uint32_t>(move.promotion) << 15);
+}
+
+Move decode_tt_move(std::uint32_t value) {
+    Move move;
+    move.from = static_cast<std::uint8_t>(value & 0x3Fu);
+    move.to = static_cast<std::uint8_t>((value >> 6) & 0x3Fu);
+    move.flag = static_cast<MoveFlag>((value >> 12) & 0x7u);
+    move.promotion = static_cast<PieceType>((value >> 15) & 0x7u);
+    return move;
+}
+
+std::uint64_t encode_tt_signed(int value, int bits) {
+    const std::int64_t mask = (1LL << bits) - 1;
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(value) & mask);
+}
+
+int decode_tt_signed(std::uint64_t value, int bits) {
+    const std::int64_t sign = 1LL << (bits - 1);
+    std::int64_t decoded = static_cast<std::int64_t>(value);
+    if ((decoded & sign) != 0) {
+        decoded -= (1LL << bits);
+    }
+    return static_cast<int>(decoded);
+}
+
+std::uint64_t pack_tt_slot(int depth, int score, TTFlag flag, Move best_move, std::uint8_t age, int ply) {
+    const std::uint64_t depth_bits = static_cast<std::uint64_t>(std::clamp(depth + 1, 1, static_cast<int>(kTtDepthMask)));
+    const std::uint64_t score_bits = encode_tt_signed(score_to_tt(score, ply), kTtScoreBits);
+    const std::uint64_t flag_bits = static_cast<std::uint64_t>(flag) & kTtFlagMask;
+    const std::uint64_t age_bits = static_cast<std::uint64_t>(age) & kTtAgeMask;
+    const std::uint64_t move_bits = static_cast<std::uint64_t>(encode_tt_move(best_move)) & kTtMoveMask;
+    return depth_bits
+        | (score_bits << kTtScoreShift)
+        | (flag_bits << kTtFlagShift)
+        | (age_bits << kTtAgeShift)
+        | (move_bits << kTtMoveShift);
+}
+
+struct DecodedTTSlot {
+    bool occupied = false;
     std::uint64_t key = 0;
     int depth = std::numeric_limits<int>::min();
     int score = 0;
     TTFlag flag = TTFlag::Exact;
     Move best_move = Move::null();
     std::uint8_t age = 0;
+};
+
+DecodedTTSlot decode_tt_slot(const std::atomic<std::uint64_t>& key_atomic, const std::atomic<std::uint64_t>& packed_atomic, int ply) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const std::uint64_t packed_before = packed_atomic.load(std::memory_order_acquire);
+        const std::uint64_t key = key_atomic.load(std::memory_order_acquire);
+        const std::uint64_t packed_after = packed_atomic.load(std::memory_order_acquire);
+        const std::uint64_t key_verify = key_atomic.load(std::memory_order_acquire);
+        if (packed_before != packed_after || key != key_verify) {
+            continue;
+        }
+        if (packed_after == 0) {
+            return {};
+        }
+        const int depth = static_cast<int>(packed_after & kTtDepthMask) - 1;
+        return DecodedTTSlot{
+            .occupied = true,
+            .key = key_verify,
+            .depth = depth,
+            .score = score_from_tt(decode_tt_signed((packed_after >> kTtScoreShift) & kTtScoreMask, kTtScoreBits), ply),
+            .flag = static_cast<TTFlag>((packed_after >> kTtFlagShift) & kTtFlagMask),
+            .best_move = decode_tt_move(static_cast<std::uint32_t>((packed_after >> kTtMoveShift) & kTtMoveMask)),
+            .age = static_cast<std::uint8_t>((packed_after >> kTtAgeShift) & kTtAgeMask),
+        };
+    }
+    return {};
+}
+
+struct TTSlot {
+    std::atomic<std::uint64_t> key{0};
+    std::atomic<std::uint64_t> packed{0};
 };
 
 constexpr std::size_t kTTClusterSize = 4;
@@ -496,75 +593,86 @@ public:
         const std::uint64_t bytes = static_cast<std::uint64_t>(std::max(1, hash_mb)) * 1024ULL * 1024ULL;
         std::size_t count = static_cast<std::size_t>(bytes / sizeof(TTCluster));
         count = std::max<std::size_t>(1, std::bit_floor(count));
-        clusters_.assign(count, TTCluster{});
+        clusters_ = std::make_unique<TTCluster[]>(count);
+        cluster_count_ = count;
         mask_ = count - 1;
-        age_ = 0;
+        age_.store(0, std::memory_order_relaxed);
+        clear();
     }
 
     void clear() {
-        std::fill(clusters_.begin(), clusters_.end(), TTCluster{});
+        if (!clusters_) {
+            return;
+        }
+        for (std::size_t index = 0; index < cluster_count_; ++index) {
+            for (TTSlot& slot : clusters_[index].slots) {
+                slot.packed.store(0, std::memory_order_relaxed);
+                slot.key.store(0, std::memory_order_relaxed);
+            }
+        }
     }
 
     void new_search() {
-        age_ = static_cast<std::uint8_t>(age_ + 1);
+        age_.fetch_add(1, std::memory_order_relaxed);
     }
 
     std::optional<TTEntry> probe(std::uint64_t key, int ply) const {
-        if (clusters_.empty()) {
+        if (!clusters_) {
             return std::nullopt;
         }
         const TTCluster& cluster = clusters_[static_cast<std::size_t>(key) & mask_];
         for (const TTSlot& slot : cluster.slots) {
-            if (slot.depth == std::numeric_limits<int>::min() || slot.key != key) {
+            const DecodedTTSlot decoded = decode_tt_slot(slot.key, slot.packed, ply);
+            if (!decoded.occupied || decoded.key != key) {
                 continue;
             }
             return TTEntry{
-                .depth = slot.depth,
-                .score = score_from_tt(slot.score, ply),
-                .flag = slot.flag,
-                .best_move = slot.best_move,
+                .depth = decoded.depth,
+                .score = decoded.score,
+                .flag = decoded.flag,
+                .best_move = decoded.best_move,
             };
         }
         return std::nullopt;
     }
 
     void store(std::uint64_t key, int depth, int score, TTFlag flag, Move best_move, int ply) {
-        if (clusters_.empty()) {
+        if (!clusters_) {
             return;
         }
         TTCluster& cluster = clusters_[static_cast<std::size_t>(key) & mask_];
         TTSlot* replacement = &cluster.slots.front();
         int replacement_value = std::numeric_limits<int>::max();
         for (TTSlot& slot : cluster.slots) {
-            if (slot.key == key) {
+            const DecodedTTSlot decoded = decode_tt_slot(slot.key, slot.packed, ply);
+            if (decoded.occupied && decoded.key == key) {
                 replacement = &slot;
                 replacement_value = std::numeric_limits<int>::min();
                 break;
             }
-            if (slot.depth == std::numeric_limits<int>::min()) {
+            if (!decoded.occupied) {
                 replacement = &slot;
                 replacement_value = std::numeric_limits<int>::min();
                 break;
             }
-            const int age_penalty = slot.age == age_ ? 0 : 64;
-            const int value = slot.depth - age_penalty;
+            const int age_penalty = decoded.age == age_.load(std::memory_order_relaxed) ? 0 : 64;
+            const int value = decoded.depth - age_penalty;
             if (value < replacement_value) {
                 replacement = &slot;
                 replacement_value = value;
             }
         }
-        replacement->key = key;
-        replacement->depth = depth;
-        replacement->score = score_to_tt(score, ply);
-        replacement->flag = flag;
-        replacement->best_move = best_move;
-        replacement->age = age_;
+        replacement->packed.store(
+            pack_tt_slot(depth, score, flag, best_move, age_.load(std::memory_order_relaxed), ply),
+            std::memory_order_relaxed);
+        replacement->key.store(key, std::memory_order_release);
     }
 
 private:
-    std::vector<TTCluster> clusters_{};
+    std::unique_ptr<TTCluster[]> clusters_{};
+    std::size_t cluster_count_ = 0;
     std::size_t mask_ = 0;
-    std::uint8_t age_ = 0;
+    std::atomic<std::uint8_t> age_{0};
 };
 
 struct PolyglotEntry {
@@ -613,9 +721,15 @@ struct AccumulatorFrame {
     bool initialized = false;
 };
 
+struct SearchSharedState;
+void shutdown_worker_pool(EngineState& state);
+void resize_worker_pool(EngineState& state, int thread_count);
+
 }  // namespace
 
 struct EngineState {
+    ~EngineState();
+
     EngineOptions options{};
     std::atomic<bool> stop_requested = false;
     FixedHashTable tt{};
@@ -623,6 +737,12 @@ struct EngineState {
     std::shared_ptr<const NnueNetwork> nnue{};
     std::filesystem::path nnue_loaded_path{};
     std::string nnue_status = "NNUE unavailable; using classical eval.";
+    std::mutex worker_mutex{};
+    std::condition_variable worker_cv{};
+    bool workers_shutdown = false;
+    std::uint64_t active_search_generation = 0;
+    std::shared_ptr<SearchSharedState> active_search{};
+    std::vector<std::thread> worker_threads{};
 #ifdef DEADFISH_WITH_SYZYGY
     std::mutex syzygy_mutex{};
     std::string syzygy_loaded_path{};
@@ -1363,15 +1483,44 @@ SearchNodeResult node_result(int score = 0, bool completed = true, Move best_mov
     return result;
 }
 
+struct SharedRootResult {
+    Move best_move = Move::null();
+    int score = 0;
+    int depth_reached = 0;
+    std::vector<Move> pv{};
+    bool completed = false;
+    int worker_index = std::numeric_limits<int>::max();
+};
+
+struct SearchSharedState {
+    Position root = Position::start_position();
+    SearchLimits limits{};
+    std::chrono::steady_clock::time_point start_time{};
+    int soft_time_ms = 0;
+    int hard_time_ms = 0;
+    std::shared_ptr<const NnueNetwork> nnue{};
+    std::atomic<bool> stop = false;
+    std::atomic<std::uint64_t> nodes = 0;
+    std::atomic<int> helpers_remaining = 0;
+    std::mutex result_mutex{};
+    SharedRootResult best_completed{};
+    std::mutex done_mutex{};
+    std::condition_variable done_cv{};
+};
+
 struct SearchContext {
     EngineState* state = nullptr;
+    SearchSharedState* shared = nullptr;
     SearchLimits limits{};
     SearchCallback callback{};
     std::chrono::steady_clock::time_point start_time{};
     std::uint64_t nodes = 0;
+    std::uint64_t pending_nodes = 0;
     bool stop = false;
     int soft_time_ms = 0;
     int hard_time_ms = 0;
+    int worker_index = 0;
+    int root_move_rotation = 0;
     std::array<std::array<Move, 2>, kMaxPly> killers{};
     std::array<std::array<std::array<int, 64>, 64>, 2> history{};
     std::shared_ptr<const NnueNetwork> nnue{};
@@ -1383,17 +1532,59 @@ int elapsed_ms(const SearchContext& context) {
         std::chrono::steady_clock::now() - context.start_time).count());
 }
 
+void flush_pending_nodes(SearchContext& context) {
+    if (!context.shared || context.pending_nodes == 0) {
+        return;
+    }
+    context.shared->nodes.fetch_add(context.pending_nodes, std::memory_order_relaxed);
+    context.pending_nodes = 0;
+}
+
+std::uint64_t visible_nodes(const SearchContext& context) {
+    if (!context.shared) {
+        return context.nodes;
+    }
+    return context.shared->nodes.load(std::memory_order_relaxed) + context.pending_nodes;
+}
+
+void record_node(SearchContext& context, std::uint64_t count = 1) {
+    context.nodes += count;
+    if (!context.shared) {
+        return;
+    }
+    context.pending_nodes += count;
+    if (context.pending_nodes >= 256) {
+        const std::uint64_t total =
+            context.shared->nodes.fetch_add(context.pending_nodes, std::memory_order_relaxed) + context.pending_nodes;
+        context.pending_nodes = 0;
+        if (context.limits.max_nodes > 0 && total >= context.limits.max_nodes) {
+            context.shared->stop.store(true, std::memory_order_relaxed);
+        }
+    }
+}
+
 bool should_stop(SearchContext& context) {
-    if (context.stop || (context.state && context.state->stop_requested.load(std::memory_order_relaxed))) {
+    if (context.stop
+        || (context.shared && context.shared->stop.load(std::memory_order_relaxed))
+        || (context.state && context.state->stop_requested.load(std::memory_order_relaxed))) {
         context.stop = true;
+        if (context.shared) {
+            context.shared->stop.store(true, std::memory_order_relaxed);
+        }
         return true;
     }
-    if (context.limits.max_nodes > 0 && context.nodes >= context.limits.max_nodes) {
+    if (context.limits.max_nodes > 0 && visible_nodes(context) >= context.limits.max_nodes) {
         context.stop = true;
+        if (context.shared) {
+            context.shared->stop.store(true, std::memory_order_relaxed);
+        }
         return true;
     }
     if (context.hard_time_ms > 0 && (context.nodes & 2047ULL) == 0 && elapsed_ms(context) >= context.hard_time_ms) {
         context.stop = true;
+        if (context.shared) {
+            context.shared->stop.store(true, std::memory_order_relaxed);
+        }
     }
     return context.stop;
 }
@@ -1760,11 +1951,73 @@ void update_quiet_cutoff_stats(SearchContext& context, Color color, const Move& 
     }
 }
 
+bool prefer_shared_root_result(const SharedRootResult& candidate, const SharedRootResult& current) {
+    if (!current.completed) {
+        return true;
+    }
+    if (candidate.depth_reached != current.depth_reached) {
+        return candidate.depth_reached > current.depth_reached;
+    }
+    if (candidate.score != current.score) {
+        return candidate.score > current.score;
+    }
+    if (candidate.worker_index != current.worker_index) {
+        return candidate.worker_index < current.worker_index;
+    }
+    return candidate.pv.size() > current.pv.size();
+}
+
+void publish_shared_root_result(SearchContext& context, const SearchNodeResult& node, int depth) {
+    if (!context.shared || !node.completed || node.best_move.is_null()) {
+        return;
+    }
+    SharedRootResult candidate;
+    candidate.best_move = node.best_move;
+    candidate.score = node.score;
+    candidate.depth_reached = depth;
+    candidate.pv = node.pv;
+    candidate.completed = true;
+    candidate.worker_index = context.worker_index;
+
+    std::lock_guard<std::mutex> guard(context.shared->result_mutex);
+    if (prefer_shared_root_result(candidate, context.shared->best_completed)) {
+        context.shared->best_completed = std::move(candidate);
+    }
+}
+
+std::vector<OrderedMove> build_root_move_order(const Position& position, const std::vector<Move>& moves, const Move& tt_move,
+                                               const std::array<std::array<Move, 2>, kMaxPly>& killers,
+                                               const std::array<std::array<std::array<int, 64>, 64>, 2>& history,
+                                               int root_rotation) {
+    std::vector<OrderedMove> ordered{};
+    std::optional<OrderedMove> tt_ordered{};
+    ordered.reserve(moves.size());
+    for (const Move& move : moves) {
+        OrderedMove scored = classify_move(position, move, killers, history, 0);
+        if (!tt_move.is_null() && move == tt_move) {
+            tt_ordered = scored;
+        } else {
+            ordered.push_back(scored);
+        }
+    }
+    std::stable_sort(ordered.begin(), ordered.end(), [](const OrderedMove& lhs, const OrderedMove& rhs) {
+        return lhs.score > rhs.score;
+    });
+    if (ordered.size() > 1 && root_rotation > 0) {
+        const std::size_t offset = static_cast<std::size_t>(root_rotation) % ordered.size();
+        std::rotate(ordered.begin(), ordered.begin() + offset, ordered.end());
+    }
+    if (tt_ordered) {
+        ordered.insert(ordered.begin(), *tt_ordered);
+    }
+    return ordered;
+}
+
 SearchNodeResult quiescence(Position& position, SearchContext& context, int alpha, int beta, int ply) {
     if (should_stop(context)) {
         return node_result(0, false);
     }
-    context.nodes += 1;
+    record_node(context);
 
     if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
         return node_result(0, true);
@@ -1904,7 +2157,7 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
         }
     }
 
-    context.nodes += 1;
+    record_node(context);
     std::vector<Move> moves = position.legal_moves_fast(false);
     if (moves.empty()) {
         if (in_check) {
@@ -1917,9 +2170,25 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
     std::vector<Move> quiets_tried;
     int move_index = 0;
     const Color us = position.side_to_move();
+    std::vector<OrderedMove> root_moves{};
     MovePicker picker(position, moves, tt_move, context.killers, context.history, ply);
     OrderedMove ordered;
-    while (picker.next(ordered)) {
+    if (ply == 0) {
+        root_moves = build_root_move_order(position, moves, tt_move, context.killers, context.history, context.root_move_rotation);
+    }
+    auto next_root_move = [&](OrderedMove& candidate, std::size_t& root_index) -> bool {
+        if (ply != 0) {
+            return picker.next(candidate);
+        }
+        if (root_index >= root_moves.size()) {
+            return false;
+        }
+        candidate = root_moves[root_index++];
+        return true;
+    };
+
+    std::size_t root_index = 0;
+    while (next_root_move(ordered, root_index)) {
         const Move move = ordered.move;
         if (!pv_node && depth >= 3 && !in_check && move.is_capture() && !move.is_promotion() &&
             ordered.see < 0) {
@@ -2026,11 +2295,179 @@ std::uint64_t perft_recursive(Position& position, int depth) {
     return nodes;
 }
 
+SearchResult run_search_worker(const Position& root, SearchContext& context) {
+    SearchResult result;
+    result.best_move = Move::null();
+    result.completed = true;
+
+    Position position = root;
+    if (context.nnue) {
+        ensure_root_nnue_frame(context, position);
+    }
+
+    const int default_depth = context.limits.infinite ? (kMaxPly - 1) : 64;
+    const int max_depth = std::max(1, context.limits.max_depth > 0 ? context.limits.max_depth : default_depth);
+    int previous_score = 0;
+    for (int depth = 1; depth <= max_depth; ++depth) {
+        SearchNodeResult node;
+        if (depth >= 4 && result.completed) {
+            int window = kDefaultAspirationWindow;
+            while (true) {
+                const int aspiration_alpha = std::max(-kInfinity, previous_score - window);
+                const int aspiration_beta = std::min(kInfinity, previous_score + window);
+                node = negamax(position, context, depth, aspiration_alpha, aspiration_beta, 0, true, true);
+                if (!node.completed) {
+                    break;
+                }
+                if (node.score <= aspiration_alpha || node.score >= aspiration_beta) {
+                    window *= 2;
+                    if (window > kInfinity / 2) {
+                        node = negamax(position, context, depth, -kInfinity, kInfinity, 0, true, true);
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        } else {
+            node = negamax(position, context, depth, -kInfinity, kInfinity, 0, true, true);
+        }
+        if (!node.completed) {
+            result.timed_out = context.stop;
+            break;
+        }
+        if (!node.best_move.is_null()) {
+            result.best_move = node.best_move;
+            result.score = node.score;
+            result.depth_reached = depth;
+            result.pv = node.pv;
+            result.completed = true;
+            previous_score = node.score;
+            publish_shared_root_result(context, node, depth);
+        }
+
+        flush_pending_nodes(context);
+        const int elapsed = elapsed_ms(context);
+        const std::uint64_t nodes = visible_nodes(context);
+        const std::uint64_t nps = elapsed > 0 ? (nodes * 1000ULL) / static_cast<std::uint64_t>(elapsed) : nodes;
+        if (context.callback) {
+            context.callback(SearchInfo{
+                .depth = depth,
+                .score = result.score,
+                .nodes = nodes,
+                .nps = nps,
+                .elapsed_ms = elapsed,
+                .pv = result.pv,
+            });
+        }
+        if (std::abs(result.score) >= kMateScore - 128) {
+            break;
+        }
+        if (context.stop || soft_limit_reached(context)) {
+            result.timed_out = true;
+            context.stop = true;
+            if (context.shared) {
+                context.shared->stop.store(true, std::memory_order_relaxed);
+            }
+            break;
+        }
+    }
+
+    flush_pending_nodes(context);
+    result.elapsed_ms = elapsed_ms(context);
+    result.nodes = visible_nodes(context);
+    result.nps = result.elapsed_ms > 0 ? (result.nodes * 1000ULL) / static_cast<std::uint64_t>(result.elapsed_ms) : result.nodes;
+    if (result.best_move.is_null()) {
+        std::vector<Move> legal = root.legal_moves();
+        if (!legal.empty()) {
+            result.best_move = first_legal_move(root, legal);
+            result.pv = {result.best_move};
+        }
+    }
+    return result;
+}
+
+SearchContext make_worker_context(EngineState& state, SearchSharedState* shared, SearchCallback callback, int worker_index) {
+    SearchContext context;
+    context.state = &state;
+    context.shared = shared;
+    context.limits = shared->limits;
+    context.callback = std::move(callback);
+    context.start_time = shared->start_time;
+    context.soft_time_ms = shared->soft_time_ms;
+    context.hard_time_ms = shared->hard_time_ms;
+    context.nnue = shared->nnue;
+    context.worker_index = worker_index;
+    context.root_move_rotation = std::max(0, worker_index);
+    return context;
+}
+
+void worker_loop(EngineState* state, int worker_index) {
+    std::uint64_t observed_generation = 0;
+    while (true) {
+        std::shared_ptr<SearchSharedState> search{};
+        {
+            std::unique_lock<std::mutex> lock(state->worker_mutex);
+            state->worker_cv.wait(lock, [&] {
+                return state->workers_shutdown || state->active_search_generation != observed_generation;
+            });
+            if (state->workers_shutdown) {
+                return;
+            }
+            observed_generation = state->active_search_generation;
+            search = state->active_search;
+        }
+        if (!search) {
+            continue;
+        }
+
+        SearchContext context = make_worker_context(*state, search.get(), {}, worker_index);
+        run_search_worker(search->root, context);
+        flush_pending_nodes(context);
+
+        if (search->helpers_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> done_guard(search->done_mutex);
+            search->done_cv.notify_all();
+        }
+    }
+}
+
+void shutdown_worker_pool(EngineState& state) {
+    {
+        std::lock_guard<std::mutex> lock(state.worker_mutex);
+        state.workers_shutdown = true;
+        state.active_search.reset();
+        state.active_search_generation += 1;
+    }
+    state.worker_cv.notify_all();
+    for (std::thread& worker : state.worker_threads) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    state.worker_threads.clear();
+    state.workers_shutdown = false;
+}
+
+void resize_worker_pool(EngineState& state, int thread_count) {
+    shutdown_worker_pool(state);
+    const int helper_count = std::max(0, thread_count - 1);
+    state.worker_threads.reserve(static_cast<std::size_t>(helper_count));
+    for (int index = 0; index < helper_count; ++index) {
+        state.worker_threads.emplace_back(worker_loop, &state, index + 1);
+    }
+}
+
 }  // namespace
+
+EngineState::~EngineState() {
+    shutdown_worker_pool(*this);
+}
 
 Engine::Engine() : state_(std::make_unique<EngineState>()) {
     state_->tt.resize_mb(state_->options.hash_mb);
     refresh_nnue_runtime(*state_);
+    resize_worker_pool(*state_, state_->options.threads);
 }
 
 Engine::~Engine() = default;
@@ -2046,10 +2483,12 @@ const EngineOptions& Engine::options() const {
 void Engine::set_options(const EngineOptions& incoming) {
     EngineOptions updated = incoming;
     updated.hash_mb = std::max(1, updated.hash_mb);
+    updated.threads = std::clamp(updated.threads, 1, 64);
     updated.syzygy_probe_limit = std::clamp(updated.syzygy_probe_limit, 0, 7);
     updated.move_overhead_ms = std::max(0, updated.move_overhead_ms);
 
     const bool resize_hash = updated.hash_mb != state_->options.hash_mb;
+    const bool resize_threads = updated.threads != state_->options.threads;
     const bool reset_book = updated.book_path != state_->options.book_path || updated.own_book != state_->options.own_book;
     const bool reset_nnue = updated.eval_file != state_->options.eval_file || updated.use_nnue != state_->options.use_nnue;
     state_->options = std::move(updated);
@@ -2057,13 +2496,16 @@ void Engine::set_options(const EngineOptions& incoming) {
     if (resize_hash) {
         state_->tt.resize_mb(state_->options.hash_mb);
     }
+    if (resize_threads) {
+        resize_worker_pool(*state_, state_->options.threads);
+    }
     if (reset_book) {
         clear_book_cache(*state_);
     }
     if (reset_nnue) {
         refresh_nnue_runtime(*state_);
     }
-    if (reset_nnue && !resize_hash) {
+    if ((reset_nnue || resize_threads) && !resize_hash) {
         state_->tt.clear();
     }
 }
@@ -2135,91 +2577,78 @@ SearchResult Engine::search(const Position& root, const SearchLimits& limits, Se
 #endif
     }
 
-    SearchContext context;
-    context.state = state_.get();
-    context.limits = limits;
-    context.callback = std::move(callback);
-    context.start_time = std::chrono::steady_clock::now();
-    context.nnue = active_nnue(*state_);
-    compute_time_budgets(root, limits, state_->options, context.soft_time_ms, context.hard_time_ms);
     state_->tt.new_search();
 
-    Position position = root;
-    if (context.nnue) {
-        ensure_root_nnue_frame(context, position);
+    if (state_->options.threads <= 1 || state_->worker_threads.empty()) {
+        SearchContext context;
+        context.state = state_.get();
+        context.limits = limits;
+        context.callback = std::move(callback);
+        context.start_time = std::chrono::steady_clock::now();
+        context.nnue = active_nnue(*state_);
+        context.worker_index = 0;
+        compute_time_budgets(root, limits, state_->options, context.soft_time_ms, context.hard_time_ms);
+        return run_search_worker(root, context);
     }
-    const int default_depth = limits.infinite ? (kMaxPly - 1) : 64;
-    const int max_depth = std::max(1, limits.max_depth > 0 ? limits.max_depth : default_depth);
-    int previous_score = 0;
-    for (int depth = 1; depth <= max_depth; ++depth) {
-        SearchNodeResult node;
-        if (depth >= 4 && result.completed) {
-            int window = kDefaultAspirationWindow;
-            while (true) {
-                const int aspiration_alpha = std::max(-kInfinity, previous_score - window);
-                const int aspiration_beta = std::min(kInfinity, previous_score + window);
-                node = negamax(position, context, depth, aspiration_alpha, aspiration_beta, 0, true, true);
-                if (!node.completed) {
-                    break;
-                }
-                if (node.score <= aspiration_alpha || node.score >= aspiration_beta) {
-                    window *= 2;
-                    if (window > kInfinity / 2) {
-                        node = negamax(position, context, depth, -kInfinity, kInfinity, 0, true, true);
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
-        } else {
-            node = negamax(position, context, depth, -kInfinity, kInfinity, 0, true, true);
-        }
-        if (!node.completed) {
-            result.timed_out = context.stop;
-            break;
-        }
-        if (!node.best_move.is_null()) {
-            result.best_move = node.best_move;
-            result.score = node.score;
-            result.depth_reached = depth;
-            result.pv = node.pv;
-            result.completed = true;
-            previous_score = node.score;
-        }
 
-        const int elapsed = elapsed_ms(context);
-        const std::uint64_t nps = elapsed > 0 ? (context.nodes * 1000ULL) / static_cast<std::uint64_t>(elapsed) : context.nodes;
-        if (context.callback) {
-            context.callback(SearchInfo{
-                .depth = depth,
-                .score = result.score,
-                .nodes = context.nodes,
-                .nps = nps,
-                .elapsed_ms = elapsed,
-                .pv = result.pv,
-            });
-        }
-        if (std::abs(result.score) >= kMateScore - 128) {
-            break;
-        }
-        if (context.stop || soft_limit_reached(context)) {
-            result.timed_out = true;
-            break;
+    auto shared = std::make_shared<SearchSharedState>();
+    shared->root = root;
+    shared->limits = limits;
+    shared->start_time = std::chrono::steady_clock::now();
+    shared->nnue = active_nnue(*state_);
+    shared->helpers_remaining.store(static_cast<int>(state_->worker_threads.size()), std::memory_order_relaxed);
+    compute_time_budgets(root, limits, state_->options, shared->soft_time_ms, shared->hard_time_ms);
+
+    {
+        std::lock_guard<std::mutex> lock(state_->worker_mutex);
+        state_->active_search = shared;
+        state_->active_search_generation += 1;
+    }
+    state_->worker_cv.notify_all();
+
+    SearchContext leader = make_worker_context(*state_, shared.get(), std::move(callback), 0);
+    SearchResult leader_result = run_search_worker(root, leader);
+    flush_pending_nodes(leader);
+
+    shared->stop.store(true, std::memory_order_relaxed);
+    {
+        std::unique_lock<std::mutex> done_lock(shared->done_mutex);
+        shared->done_cv.wait(done_lock, [&] {
+            return shared->helpers_remaining.load(std::memory_order_acquire) == 0;
+        });
+    }
+    {
+        std::lock_guard<std::mutex> lock(state_->worker_mutex);
+        if (state_->active_search == shared) {
+            state_->active_search.reset();
         }
     }
 
-    result.elapsed_ms = elapsed_ms(context);
-    result.nodes = context.nodes;
-    result.nps = result.elapsed_ms > 0 ? (context.nodes * 1000ULL) / static_cast<std::uint64_t>(result.elapsed_ms) : context.nodes;
-    if (result.best_move.is_null()) {
+    SharedRootResult best_completed;
+    {
+        std::lock_guard<std::mutex> guard(shared->result_mutex);
+        best_completed = shared->best_completed;
+    }
+    if (best_completed.completed && !best_completed.best_move.is_null()) {
+        leader_result.best_move = best_completed.best_move;
+        leader_result.score = best_completed.score;
+        leader_result.depth_reached = best_completed.depth_reached;
+        leader_result.pv = best_completed.pv;
+        leader_result.completed = true;
+    }
+    leader_result.elapsed_ms = elapsed_ms(leader);
+    leader_result.nodes = shared->nodes.load(std::memory_order_relaxed);
+    leader_result.nps = leader_result.elapsed_ms > 0
+        ? (leader_result.nodes * 1000ULL) / static_cast<std::uint64_t>(leader_result.elapsed_ms)
+        : leader_result.nodes;
+    if (leader_result.best_move.is_null()) {
         std::vector<Move> legal = root.legal_moves();
         if (!legal.empty()) {
-            result.best_move = first_legal_move(root, legal);
-            result.pv = {result.best_move};
+            leader_result.best_move = first_legal_move(root, legal);
+            leader_result.pv = {leader_result.best_move};
         }
     }
-    return result;
+    return leader_result;
 }
 
 std::uint64_t Engine::perft(const Position& root, int depth) {

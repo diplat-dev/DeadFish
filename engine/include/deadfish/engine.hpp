@@ -93,6 +93,7 @@ struct SearchInfo {
 
 struct EngineOptions {
     int hash_mb = 32;
+    int threads = 1;
     bool use_nnue = false;
     std::string eval_file;
     bool own_book = true;

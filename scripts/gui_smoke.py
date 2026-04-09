@@ -127,6 +127,7 @@ def main() -> int:
     pump(controller, lambda: controller.engine_ready)
     expected_options = {
         "Hash",
+        "Threads",
         "Clear Hash",
         "UseNNUE",
         "EvalFile",
@@ -195,6 +196,14 @@ def main() -> int:
     )
     pump(controller, lambda: controller.analysis.depth > 0 and controller.analysis.pv != "")
     expect(controller.analysis.depth > 0, "analysis resumes after settings are applied")
+    applied, _ = controller.apply_option_drafts({"Threads": 2})
+    expect(applied, "controller applies Threads while analysis is active")
+    pump(
+        controller,
+        lambda: controller.engine_ready and controller.applied_option_values.get("Threads") == 2,
+    )
+    pump(controller, lambda: controller.analysis.depth > 0 and controller.analysis.pv != "")
+    expect(controller.analysis.depth > 0, "analysis resumes after Threads changes")
     controller.set_analysis_enabled(False)
     pump(controller, lambda: controller.search_kind == "idle" and not controller.waiting_for_stop, timeout=15.0)
     expect(controller.search_kind == "idle", "analysis search stops cleanly")
