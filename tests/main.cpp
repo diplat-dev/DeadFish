@@ -373,6 +373,10 @@ void test_perft(TestContext& t) {
         {"8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 1, 14, "position 3 depth 1"},
         {"8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 2, 191, "position 3 depth 2"},
         {"8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 3, 2812, "position 3 depth 3"},
+        {"rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 1, 44, "promotion/check perft depth 1"},
+        {"rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 2, 1486, "promotion/check perft depth 2"},
+        {"r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 1, 46, "pin/evasion perft depth 1"},
+        {"r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 2, 2079, "pin/evasion perft depth 2"},
     };
     for (const auto& test : cases) {
         Position position = Position::from_fen(test.fen);
@@ -405,7 +409,11 @@ void test_search(TestContext& t) {
     SearchLimits mate_limits;
     mate_limits.max_depth = 3;
     SearchResult mate_result = engine.search(mate_in_one, mate_limits);
-    t.expect(mate_result.best_move.to_uci() == "g6f6", "search finds mate in one");
+    t.expect(!mate_result.best_move.is_null(), "search finds a mate-in-one move");
+    std::string mate_error;
+    Position mate_after = mate_in_one;
+    t.expect(mate_after.apply_uci_move(mate_result.best_move.to_uci(), &mate_error), "mate-in-one move applies");
+    t.expect(mate_error.empty() && mate_after.is_checkmate() && mate_result.score > 90000, "search scores mate in one");
 
     Position start = Position::start_position();
     SearchLimits timed;

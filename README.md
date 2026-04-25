@@ -6,9 +6,9 @@ The browser/WebAssembly path has been intentionally removed so the active codeba
 
 ## Features
 
-- Custom bitboard engine core with legal move generation, compact delta make/unmake, repetition tracking, and full Zobrist hashing
-- Iterative deepening with alpha-beta, aspiration windows, PVS, quiescence, null-move pruning, LMR, killer/history heuristics, SEE-based move handling, a clustered fixed-size TT, and Lazy SMP multi-threading
-- Classical tapered evaluation with material, piece-square terms, mobility, king safety, pawn structure, passed pawns, bishop pair, rook file bonuses, simplification, and tempo
+- Custom bitboard engine core with fixed-capacity search move lists, pseudo-legal hot-path move generation, compact delta make/unmake, repetition tracking, and full Zobrist hashing
+- Iterative deepening with alpha-beta, aspiration windows, PVS, quiescence, verified null-move pruning, probcut, razoring, adaptive LMR, singular-style TT move extension, killer/history/countermove/continuation heuristics, SEE-based move handling, a clustered fixed-size TT, and Lazy SMP multi-threading
+- Classical tapered evaluation with material, piece-square terms, mobility, king safety, pawn structure, passed pawns, threats, space, activity, outposts, rook file/7th-rank bonuses, endgame scaling, simplification, and tempo
 - Engine-side float32 `DFNNUE1` inference with search-local accumulators, plus safe fallback to classical eval when no network is loaded
 - Minimal UCI support for `uci`, `isready`, `ucinewgame`, `position`, `go depth`, `go nodes`, `go movetime`, `go wtime/btime/winc/binc/movestogo`, `go infinite`, `stop`, `quit`, and engine options
 - Windows-first Tkinter UCI GUI with play mode, live analysis, FEN tools, and dynamic UCI option editing
@@ -279,6 +279,17 @@ The `eval` command is useful for NNUE debugging and parity checks. It returns th
 
 The `cutechess`-based scripts require a local `cutechess-cli` install and external engine binaries; they are included as measurement tooling and are not required for normal builds.
 
+## Current Classical Strength Snapshot
+
+The current classical engine is the default path (`UseNNUE=false`) and is the recommended baseline for strength testing. Recent local measurements at `Hash=64`, `Threads=1`, `OwnBook=false`, `UseNNUE=false`, and `1+0.01`:
+
+- fixed-depth bench versus commit `11f5b93`: about `2.1x` generic and `2.4x` native faster by elapsed time
+- start position, 1 second, no book: depth 13 at roughly `435k` NPS versus `11f5b93` at roughly `352k` NPS
+- 100-game cutechess match versus `11f5b93`: `53W 39D 8L`, about `+168 Elo`, LOS `100%`
+- quick Stockfish 18 limited-strength ladder: roughly `2110-2130` on that local ladder
+
+The Stockfish limited-strength number is a practical regression yardstick, not a CCRL/FIDE-equivalent rating. For publishable strength claims, run a larger gauntlet against fixed-version engines with known rating-list anchors.
+
 ## Training Toolkit
 
 The NNUE data and training flow lives under [`training/`](./training/README.md). It currently includes:
@@ -340,7 +351,7 @@ The native test suite covers:
 - FEN parse and serialize round trips
 - make/unmake and null-move state restoration
 - castling, en passant, promotion, mate, stalemate, repetition, fifty-move, and insufficient-material cases
-- perft on the starting position, Kiwipete, and additional tactical reference positions
+- perft on the starting position, Kiwipete, tactical reference positions, promotion/check cases, and pin/evasion cases
 - SEE regression checks for winning, equal, and losing exchanges
 - search smoke tests for mate finding, movetime limits, and clock-based limits
 - deterministic NNUE loader, fallback, and fixed-score regression checks
@@ -350,7 +361,7 @@ The native test suite covers:
 
 The current tree includes:
 
-- the first native speed refactor: compact undo, staged move picking, and clustered TT replacement
+- the competitive classical core pass: fixed-capacity search move lists, faster bitboard ray attacks, pseudo-legal search movegen, richer TT/eval caches, stronger selectivity, and expanded handcrafted eval
 - native generic-vs-tuned profiling and repeatable regression tooling
 - cutechess-based gauntlet scaffolding and a small example engine ladder
 - the first NNUE data/training/export pipeline under `training/`
@@ -358,5 +369,7 @@ The current tree includes:
 
 Still planned for the engine itself:
 
+- deeper pin/check-evasion-only legal move generation for another search hot-path pass
+- more serious external gauntlets against fixed-version rating-list engines
 - heavier real-world NNUE training runs and tuning
-- multi-threaded search with `Threads`
+- stronger Lazy SMP scaling and thread-aware tuning
