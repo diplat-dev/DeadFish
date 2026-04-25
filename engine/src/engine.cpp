@@ -423,14 +423,6 @@ int square_table_value(const std::array<int, 64>& table, int square, Color color
     return color == Color::White ? table[square] : table[mirror_square(square)];
 }
 
-int phase_value(const Position& position) {
-    int phase = 0;
-    for (const Piece piece : position.board()) {
-        phase += kPiecePhaseWeights[static_cast<std::size_t>(piece_type(piece))];
-    }
-    return std::min(24, phase);
-}
-
 }  // namespace
 
 }  // namespace deadfish
@@ -443,6 +435,7 @@ constexpr int kHistoryMax = 32768;
 constexpr int kDefaultAspirationWindow = 24;
 constexpr int kWinningSeeBonus = 130000;
 constexpr int kLosingCaptureBase = 45000;
+constexpr int kSeeUnknown = std::numeric_limits<int>::min();
 
 enum class TTFlag : std::uint8_t {
     Exact = 0,
@@ -1593,6 +1586,10 @@ bool soft_limit_reached(const SearchContext& context) {
     return context.soft_time_ms > 0 && elapsed_ms(context) >= context.soft_time_ms;
 }
 
+bool hard_limit_reached(const SearchContext& context) {
+    return context.hard_time_ms > 0 && elapsed_ms(context) >= context.hard_time_ms;
+}
+
 bool nnue_active(const SearchContext& context) {
     return context.nnue != nullptr;
 }
@@ -1641,6 +1638,18 @@ int move_history_penalty(int depth) {
 
 void update_history_value(int& entry, int delta) {
     entry = std::clamp(entry + delta, -kHistoryMax, kHistoryMax);
+}
+
+int piece_value(PieceType type) {
+    return kPieceValues[static_cast<std::size_t>(type)];
+}
+
+int move_attacker_value(const Position& position, const Move& move) {
+    const Piece mover = position.piece_at(move.from);
+    if (mover == Piece::None) {
+        return 0;
+    }
+    return piece_value(piece_type(mover));
 }
 
 Bitboard attacks_to(const Position& position, int square, Bitboard occ, Color by_color) {
@@ -1784,9 +1793,16 @@ int see_value(const Position& position, const Move& move) {
 struct OrderedMove {
     Move move = Move::null();
     int score = 0;
-    int see = 0;
+    int see = kSeeUnknown;
     bool quiet = true;
 };
+
+int ensure_see(const Position& position, OrderedMove& ordered) {
+    if (ordered.see == kSeeUnknown && ordered.move.is_capture()) {
+        ordered.see = see_value(position, ordered.move);
+    }
+    return ordered.see == kSeeUnknown ? 0 : ordered.see;
+}
 
 OrderedMove classify_move(const Position& position, const Move& move,
                           const std::array<std::array<Move, 2>, kMaxPly>& killers,
@@ -1798,12 +1814,17 @@ OrderedMove classify_move(const Position& position, const Move& move,
 
     const Piece victim = captured_piece_for_move(position, move);
     if (move.is_capture()) {
-        ordered.see = see_value(position, move);
-        ordered.score += ordered.see >= 0 ? kWinningSeeBonus + ordered.see : kLosingCaptureBase + ordered.see;
-        ordered.score += kPieceValues[static_cast<std::size_t>(piece_type(victim))] * 16;
+        const int victim_value = piece_value(piece_type(victim));
+        const int attacker_value = move_attacker_value(position, move);
+        if (!move.is_promotion() && victim_value < attacker_value) {
+            ordered.see = see_value(position, move);
+        }
+        const bool likely_good = ordered.see == kSeeUnknown || ordered.see >= 0;
+        ordered.score += likely_good ? kWinningSeeBonus : kLosingCaptureBase + ordered.see;
+        ordered.score += victim_value * 16 - attacker_value / 2;
     }
     if (move.is_promotion()) {
-        ordered.score += 95'000 + kPieceValues[static_cast<std::size_t>(move.promotion)];
+        ordered.score += 95'000 + piece_value(move.promotion);
     }
     if (ordered.quiet && ply < kMaxPly) {
         if (move == killers[ply][0]) {
@@ -1836,6 +1857,9 @@ public:
                const std::array<std::array<Move, 2>, kMaxPly>& killers,
                const std::array<std::array<std::array<int, 64>, 64>, 2>& history,
                int ply) {
+        good_tacticals_.reserve(moves.size());
+        quiets_.reserve(moves.size());
+        bad_tacticals_.reserve(moves.size());
         for (const Move& move : moves) {
             if (!tt_move.is_null() && move == tt_move) {
                 tt_move_ = move;
@@ -1845,7 +1869,7 @@ public:
             OrderedMove ordered = classify_move(position, move, killers, history, ply);
             if (ordered.quiet) {
                 quiets_.push_back(ordered);
-            } else if (move.is_promotion() || ordered.see >= 0) {
+            } else if (move.is_promotion() || ordered.see == kSeeUnknown || ordered.see >= 0) {
                 good_tacticals_.push_back(ordered);
             } else {
                 bad_tacticals_.push_back(ordered);
@@ -1858,7 +1882,7 @@ public:
             tt_used_ = true;
             move.move = tt_move_;
             move.score = 1'000'000;
-            move.see = 0;
+            move.see = kSeeUnknown;
             move.quiet = !tt_move_.is_capture() && !tt_move_.is_promotion();
             return true;
         }
@@ -1888,6 +1912,35 @@ private:
     std::size_t quiet_index_ = 0;
     std::size_t bad_index_ = 0;
 };
+
+void append_legal_quiet_queen_promotions(Position& position, std::vector<Move>& moves) {
+    const Color us = position.side_to_move();
+    const Piece pawn = make_piece(us, PieceType::Pawn);
+    const int promotion_from_rank = us == Color::White ? 6 : 1;
+    const int direction = us == Color::White ? 8 : -8;
+    for (int file = 0; file < 8; ++file) {
+        const int from = make_square(file, promotion_from_rank);
+        const int to = from + direction;
+        if (position.piece_at(from) != pawn || position.piece_at(to) != Piece::None) {
+            continue;
+        }
+        Move move{
+            .from = static_cast<std::uint8_t>(from),
+            .to = static_cast<std::uint8_t>(to),
+            .flag = MoveFlag::Promotion,
+            .promotion = PieceType::Queen,
+        };
+        UndoState undo;
+        if (!position.make_move(move, undo)) {
+            continue;
+        }
+        const bool legal = !position.in_check(us);
+        position.unmake_move(undo);
+        if (legal) {
+            moves.push_back(move);
+        }
+    }
+}
 
 Move first_legal_move(const Position& position, const std::vector<Move>& moves) {
     for (const Move& move : moves) {
@@ -2013,6 +2066,52 @@ std::vector<OrderedMove> build_root_move_order(const Position& position, const s
     return ordered;
 }
 
+int reverse_futility_margin(int depth) {
+    return 70 * depth;
+}
+
+int futility_margin(int depth) {
+    return 60 + 90 * depth;
+}
+
+int late_quiet_threshold(int depth) {
+    switch (depth) {
+        case 1:
+            return 4;
+        case 2:
+            return 6;
+        case 3:
+            return 10;
+        default:
+            return 14;
+    }
+}
+
+int late_move_reduction(int depth, int move_index, bool pv_node, bool quiet, bool gives_check, int history_score) {
+    if (!quiet || gives_check || depth < 3 || move_index < 3) {
+        return 0;
+    }
+    if (pv_node && move_index < 6) {
+        return 0;
+    }
+    int reduction = 1;
+    if (depth >= 5 && move_index >= 6) {
+        reduction += 1;
+    }
+    if (depth >= 8 && move_index >= 12) {
+        reduction += 1;
+    }
+    if (pv_node) {
+        reduction -= 1;
+    }
+    if (history_score > 8000) {
+        reduction -= 1;
+    } else if (history_score < -8000 && depth >= 5) {
+        reduction += 1;
+    }
+    return std::clamp(reduction, 0, std::max(0, depth - 2));
+}
+
 SearchNodeResult quiescence(Position& position, SearchContext& context, int alpha, int beta, int ply) {
     if (should_stop(context)) {
         return node_result(0, false);
@@ -2036,27 +2135,35 @@ SearchNodeResult quiescence(Position& position, SearchContext& context, int alph
         alpha = stand_pat;
     }
 
-    std::vector<Move> moves = position.in_check(position.side_to_move())
+    const bool in_check = position.in_check(position.side_to_move());
+    std::vector<Move> moves = in_check
         ? position.legal_moves_fast(false)
         : position.legal_moves_fast(true);
+    if (!in_check) {
+        append_legal_quiet_queen_promotions(position, moves);
+    }
     if (moves.empty()) {
-        if (position.in_check(position.side_to_move())) {
+        if (in_check) {
             return node_result(-kMateScore + ply, true);
         }
         return node_result(alpha, true);
     }
 
     SearchNodeResult best = node_result(alpha, true);
-    const bool in_check = position.in_check(position.side_to_move());
     MovePicker picker(position, moves, Move::null(), context.killers, context.history, ply);
     OrderedMove ordered;
     while (picker.next(ordered)) {
         const Move move = ordered.move;
-        if (!in_check && move.is_capture() && !move.is_promotion() && ordered.see < 0) {
-            continue;
-        }
+        const int see = (!in_check && move.is_capture() && !move.is_promotion())
+            ? ensure_see(position, ordered)
+            : 0;
         UndoState undo;
         if (!position.make_move(move, undo)) {
+            continue;
+        }
+        const bool gives_check = position.in_check(position.side_to_move());
+        if (!in_check && move.is_capture() && !move.is_promotion() && see < 0 && !gives_check) {
+            position.unmake_move(undo);
             continue;
         }
         if (nnue_active(context)) {
@@ -2136,7 +2243,22 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
     }
 
     const bool in_check = position.in_check(position.side_to_move());
-    if (!pv_node && allow_null && depth >= 3 && !in_check && !is_zugzwang_prone(position)) {
+    int static_eval = 0;
+    bool has_static_eval = false;
+    auto current_static_eval = [&]() {
+        if (!has_static_eval) {
+            static_eval = evaluate_position(position, context, ply);
+            has_static_eval = true;
+        }
+        return static_eval;
+    };
+
+    if (!pv_node && !in_check && depth <= 3 && current_static_eval() - reverse_futility_margin(depth) >= beta) {
+        return node_result(static_eval, true);
+    }
+
+    if (!pv_node && allow_null && depth >= 3 && !in_check && !is_zugzwang_prone(position) &&
+        current_static_eval() >= beta) {
         UndoState undo;
         if (position.make_null_move(undo)) {
             if (nnue_active(context)) {
@@ -2145,7 +2267,8 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
                     context.nnue_frames[static_cast<std::size_t>(ply)],
                     context.nnue->accumulator_size);
             }
-            const int reduction = depth >= 6 ? 3 : 2;
+            const int eval_margin = std::clamp((static_eval - beta) / 200, 0, 2);
+            const int reduction = std::clamp(2 + depth / 5 + eval_margin, 2, std::max(2, depth - 1));
             SearchNodeResult child = negamax(position, context, depth - 1 - reduction, -beta, -beta + 1, ply + 1, false, false);
             position.unmake_move(undo);
             if (!child.completed) {
@@ -2168,6 +2291,7 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
 
     SearchNodeResult best = node_result(-kInfinity, true);
     std::vector<Move> quiets_tried;
+    quiets_tried.reserve(moves.size());
     int move_index = 0;
     const Color us = position.side_to_move();
     std::vector<OrderedMove> root_moves{};
@@ -2190,16 +2314,41 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
     std::size_t root_index = 0;
     while (next_root_move(ordered, root_index)) {
         const Move move = ordered.move;
-        if (!pv_node && depth >= 3 && !in_check && move.is_capture() && !move.is_promotion() &&
-            ordered.see < 0) {
-            ++move_index;
-            continue;
-        }
+        const int see = (!pv_node && depth >= 3 && !in_check && move.is_capture() && !move.is_promotion())
+            ? ensure_see(position, ordered)
+            : 0;
+        const bool quiet = ordered.quiet;
+        const int history_score = quiet
+            ? context.history[static_cast<std::size_t>(us)][move.from][move.to]
+            : 0;
+        const int parent_eval = (!pv_node && ply > 0 && !in_check && quiet && !move.is_promotion())
+            ? current_static_eval()
+            : 0;
 
         UndoState undo;
         if (!position.make_move(move, undo)) {
             ++move_index;
             continue;
+        }
+        const bool gives_check = position.in_check(position.side_to_move());
+        if (!pv_node && depth >= 3 && !in_check && move.is_capture() && !move.is_promotion() &&
+            see < 0 && !gives_check) {
+            position.unmake_move(undo);
+            ++move_index;
+            continue;
+        }
+
+        if (!pv_node && ply > 0 && !in_check && quiet && !gives_check && !move.is_promotion()) {
+            if (depth <= 3 && move_index > 0 && parent_eval + futility_margin(depth) <= alpha) {
+                position.unmake_move(undo);
+                ++move_index;
+                continue;
+            }
+            if (depth <= 4 && move_index >= late_quiet_threshold(depth) && history_score <= 0) {
+                position.unmake_move(undo);
+                ++move_index;
+                continue;
+            }
         }
         if (nnue_active(context)) {
             update_search_frame_for_move(
@@ -2210,14 +2359,7 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
                 undo);
         }
 
-        const bool quiet = ordered.quiet;
-        int reduction = 0;
-        if (!pv_node && quiet && depth >= 3 && move_index >= 3) {
-            reduction = 1;
-            if (depth >= 6 && move_index >= 6) {
-                reduction += 1;
-            }
-        }
+        const int reduction = late_move_reduction(depth, move_index, pv_node, quiet, gives_check, history_score);
 
         SearchNodeResult child;
         if (move_index == 0) {
@@ -2242,7 +2384,10 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
             return node_result(0, false);
         }
 
-        const int score = -child.score;
+        int score = -child.score;
+        if (ply == 0 && !tt_move.is_null() && move == tt_move && std::abs(score) < kMateScore - kMaxPly) {
+            score += 8;
+        }
         if (score > best.score) {
             best.score = score;
             best.best_move = move;
@@ -2308,6 +2453,7 @@ SearchResult run_search_worker(const Position& root, SearchContext& context) {
     const int default_depth = context.limits.infinite ? (kMaxPly - 1) : 64;
     const int max_depth = std::max(1, context.limits.max_depth > 0 ? context.limits.max_depth : default_depth);
     int previous_score = 0;
+    int root_stability = 0;
     for (int depth = 1; depth <= max_depth; ++depth) {
         SearchNodeResult node;
         if (depth >= 4 && result.completed) {
@@ -2336,7 +2482,15 @@ SearchResult run_search_worker(const Position& root, SearchContext& context) {
             result.timed_out = context.stop;
             break;
         }
+        const Move previous_best = result.best_move;
+        const int previous_completed_score = result.score;
+        const int previous_completed_depth = result.depth_reached;
+        bool root_unstable = false;
+        bool score_dropped = false;
         if (!node.best_move.is_null()) {
+            root_unstable = !previous_best.is_null() && node.best_move != previous_best;
+            root_stability = (!previous_best.is_null() && node.best_move == previous_best) ? root_stability + 1 : 0;
+            score_dropped = previous_completed_depth >= 3 && node.score + 80 < previous_completed_score;
             result.best_move = node.best_move;
             result.score = node.score;
             result.depth_reached = depth;
@@ -2363,7 +2517,11 @@ SearchResult run_search_worker(const Position& root, SearchContext& context) {
         if (std::abs(result.score) >= kMateScore - 128) {
             break;
         }
-        if (context.stop || soft_limit_reached(context)) {
+        const bool soft_reached = soft_limit_reached(context);
+        const bool can_extend_time = soft_reached && context.hard_time_ms > context.soft_time_ms &&
+            context.hard_time_ms - context.soft_time_ms >= 30 && depth >= 4 &&
+            elapsed + 5 < context.hard_time_ms && (root_unstable || score_dropped || root_stability < 2);
+        if (context.stop || hard_limit_reached(context) || (soft_reached && !can_extend_time)) {
             result.timed_out = true;
             context.stop = true;
             if (context.shared) {
@@ -3176,6 +3334,7 @@ bool Position::in_check(Color color) const {
 
 std::vector<Move> Position::generate_pseudo_moves(bool captures_only) const {
     std::vector<Move> moves;
+    moves.reserve(captures_only ? 32 : 96);
     const Color us = side_to_move_;
     const Color them = opposite(us);
     auto push_move = [&](int from, int to, MoveFlag flag, PieceType promotion = PieceType::None) {
@@ -3849,19 +4008,151 @@ int count_center_control(const Position& position, int square, Piece piece) {
     return score;
 }
 
-int count_king_ring_attacks(const Position& position, int king_square, Color attacker) {
+Bitboard attacks_from_for_eval(const Position& position, int square, Piece piece) {
+    const PieceType type = piece_type(piece);
+    const Color color = piece_color(piece);
+    if (type == PieceType::Knight) {
+        return kKnightAttacks[square];
+    }
+    if (type == PieceType::King) {
+        return kKingAttacks[square];
+    }
+    if (type == PieceType::Pawn) {
+        return kPawnAttacks[static_cast<std::size_t>(color)][square];
+    }
+
+    Bitboard attacks = 0;
+    auto add_ray = [&](int df, int dr) {
+        int file = square_file(square) + df;
+        int rank = square_rank(square) + dr;
+        while (file >= 0 && file < 8 && rank >= 0 && rank < 8) {
+            const int target = make_square(file, rank);
+            attacks |= bit_at(target);
+            if (position.piece_at(target) != Piece::None) {
+                break;
+            }
+            file += df;
+            rank += dr;
+        }
+    };
+
+    if (type == PieceType::Bishop || type == PieceType::Queen) {
+        add_ray(1, 1);
+        add_ray(1, -1);
+        add_ray(-1, 1);
+        add_ray(-1, -1);
+    }
+    if (type == PieceType::Rook || type == PieceType::Queen) {
+        add_ray(1, 0);
+        add_ray(-1, 0);
+        add_ray(0, 1);
+        add_ray(0, -1);
+    }
+    return attacks;
+}
+
+int king_attack_weight(PieceType type) {
+    switch (type) {
+        case PieceType::Pawn:
+            return 6;
+        case PieceType::Knight:
+            return 16;
+        case PieceType::Bishop:
+            return 14;
+        case PieceType::Rook:
+            return 18;
+        case PieceType::Queen:
+            return 28;
+        default:
+            return 0;
+    }
+}
+
+int count_king_ring_pressure(const Position& position, int king_square, Color attacker) {
     if (king_square == kNoSquare) {
         return 0;
     }
-    int attacks = 0;
+    int pressure = 0;
+    int attackers = 0;
     Bitboard ring = kKingAttacks[king_square] | bit_at(king_square);
-    while (ring) {
-        const int square = pop_lsb(ring);
-        if (position.is_square_attacked(square, attacker)) {
-            attacks += 1;
+    const auto& board = position.board();
+    for (int square = 0; square < 64; ++square) {
+        const Piece piece = board[square];
+        if (piece == Piece::None || piece_color(piece) != attacker) {
+            continue;
+        }
+        const PieceType type = piece_type(piece);
+        if (type == PieceType::King) {
+            continue;
+        }
+        const int hits = std::popcount(attacks_from_for_eval(position, square, piece) & ring);
+        if (hits > 0) {
+            attackers += 1;
+            pressure += hits * king_attack_weight(type);
         }
     }
-    return attacks;
+    return std::min(140, pressure + attackers * attackers * 3);
+}
+
+int king_distance(int a, int b) {
+    if (a == kNoSquare || b == kNoSquare) {
+        return 4;
+    }
+    return std::max(std::abs(square_file(a) - square_file(b)), std::abs(square_rank(a) - square_rank(b)));
+}
+
+bool pawn_protected_by_color(const Position& position, int square, Color color) {
+    const int file = square_file(square);
+    if (color == Color::White) {
+        return (file > 0 && square >= 9 && position.piece_at(square - 9) == Piece::WPawn) ||
+               (file < 7 && square >= 7 && position.piece_at(square - 7) == Piece::WPawn);
+    }
+    return (file > 0 && square <= 55 && position.piece_at(square + 7) == Piece::BPawn) ||
+           (file < 7 && square <= 54 && position.piece_at(square + 9) == Piece::BPawn);
+}
+
+bool connected_friendly_pawn(const Position& position, int square, Color color) {
+    const Piece pawn = make_piece(color, PieceType::Pawn);
+    const int file = square_file(square);
+    const int rank = square_rank(square);
+    for (int df : {-1, 1}) {
+        const int next_file = file + df;
+        if (next_file < 0 || next_file >= 8) {
+            continue;
+        }
+        for (int dr = -1; dr <= 1; ++dr) {
+            const int next_rank = rank + dr;
+            if (next_rank >= 0 && next_rank < 8 && position.piece_at(make_square(next_file, next_rank)) == pawn) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool enemy_pawn_can_challenge(const Position& position, int square, Color color) {
+    const Piece enemy_pawn = make_piece(opposite(color), PieceType::Pawn);
+    const int file = square_file(square);
+    const int rank = square_rank(square);
+    for (int scan_file = std::max(0, file - 1); scan_file <= std::min(7, file + 1); ++scan_file) {
+        if (scan_file == file) {
+            continue;
+        }
+        if (color == Color::White) {
+            for (int scan_rank = rank + 1; scan_rank < 8; ++scan_rank) {
+                if (position.piece_at(make_square(scan_file, scan_rank)) == enemy_pawn) {
+                    return true;
+                }
+            }
+        } else {
+            for (int scan_rank = rank - 1; scan_rank >= 0; --scan_rank) {
+                if (position.piece_at(make_square(scan_file, scan_rank)) == enemy_pawn) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 struct ClassicalEvalBreakdown {
@@ -3883,17 +4174,22 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
         int passed_pawns = 0;
         int rook_files = 0;
         int bishop_pair = 0;
+        int outposts = 0;
         int simplification = 0;
         int king_square = kNoSquare;
         int bishops = 0;
         std::array<int, 8> pawn_files{};
         std::vector<int> pawns;
+        std::vector<int> passed_pawn_squares;
+        std::vector<int> knights;
+        std::vector<int> bishop_squares;
         std::vector<int> rooks;
     };
 
     SideEval white;
     SideEval black;
     const auto& board = position.board();
+    int raw_phase = 0;
 
     for (int square = 0; square < 64; ++square) {
         const Piece piece = board[square];
@@ -3903,6 +4199,7 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
         const Color color = piece_color(piece);
         SideEval& side = color == Color::White ? white : black;
         const PieceType type = piece_type(piece);
+        raw_phase += kPiecePhaseWeights[static_cast<std::size_t>(type)];
         side.material += kPieceValues[static_cast<std::size_t>(type)];
         side.material_middle += kPieceValues[static_cast<std::size_t>(type)];
         side.material_endgame += kPieceValuesEndgame[static_cast<std::size_t>(type)];
@@ -3917,11 +4214,13 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
             case PieceType::Knight:
                 side.positional_middle += square_table_value(kKnightTable, square, color);
                 side.positional_endgame += square_table_value(kKnightTable, square, color) / 2;
+                side.knights.push_back(square);
                 break;
             case PieceType::Bishop:
                 side.positional_middle += square_table_value(kBishopTable, square, color);
                 side.positional_endgame += square_table_value(kBishopTable, square, color);
                 side.bishops += 1;
+                side.bishop_squares.push_back(square);
                 break;
             case PieceType::Rook:
                 side.positional_middle += square_table_value(kRookTable, square, color);
@@ -3957,6 +4256,7 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
         for (int square : side.pawns) {
             const int file = square_file(square);
             const int rank = square_rank(square);
+            const int advance = color == Color::White ? rank : 7 - rank;
             if (side.pawn_files[file] > 1) {
                 side.pawn_structure -= 12 * (side.pawn_files[file] - 1);
             }
@@ -3991,8 +4291,23 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
                 }
             }
             if (passed) {
-                const int advance = color == Color::White ? rank : 7 - rank;
-                side.passed_pawns += kPassedPawnBonus[advance];
+                int bonus = kPassedPawnBonus[advance];
+                const int forward = color == Color::White ? square + 8 : square - 8;
+                const int promotion_square = make_square(file, color == Color::White ? 7 : 0);
+                if (pawn_protected_by_color(position, square, color)) {
+                    bonus += advance * 3;
+                }
+                if (connected_friendly_pawn(position, square, color)) {
+                    bonus += advance * 2;
+                }
+                if (forward >= 0 && forward < 64 && board[forward] != Piece::None) {
+                    bonus -= advance * 5;
+                }
+                const int friendly_distance = king_distance(side.king_square, square);
+                const int enemy_distance = king_distance(enemy.king_square, promotion_square);
+                bonus += (enemy_distance - friendly_distance) * (advance >= 4 ? 4 : 2);
+                side.passed_pawns += bonus;
+                side.passed_pawn_squares.push_back(square);
             }
         }
     };
@@ -4000,9 +4315,37 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
     evaluate_pawns(Color::White, white, black);
     evaluate_pawns(Color::Black, black, white);
 
-    auto evaluate_rooks = [&](SideEval& side, const SideEval& enemy) {
+    auto evaluate_outposts = [&](Color color, SideEval& side) {
+        auto score_minor = [&](int square, PieceType type) {
+            const int rank = square_rank(square);
+            const int advance = color == Color::White ? rank : 7 - rank;
+            if (advance < 3 || !pawn_protected_by_color(position, square, color) ||
+                enemy_pawn_can_challenge(position, square, color)) {
+                return 0;
+            }
+            int bonus = type == PieceType::Knight ? 22 : 12;
+            if (is_center_square(square)) {
+                bonus += 8;
+            } else if (is_extended_center_square(square)) {
+                bonus += 4;
+            }
+            return bonus + std::max(0, advance - 3) * 3;
+        };
+        for (int square : side.knights) {
+            side.outposts += score_minor(square, PieceType::Knight);
+        }
+        for (int square : side.bishop_squares) {
+            side.outposts += score_minor(square, PieceType::Bishop);
+        }
+    };
+
+    evaluate_outposts(Color::White, white);
+    evaluate_outposts(Color::Black, black);
+
+    auto evaluate_rooks = [&](Color color, SideEval& side, const SideEval& enemy) {
         for (int square : side.rooks) {
             const int file = square_file(square);
+            const int rank = square_rank(square);
             const bool friendly_pawn = side.pawn_files[file] > 0;
             const bool enemy_pawn = enemy.pawn_files[file] > 0;
             if (!friendly_pawn && !enemy_pawn) {
@@ -4013,12 +4356,31 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
             if (is_center_square(square) || is_extended_center_square(square)) {
                 side.rook_files += 4;
             }
+            if ((color == Color::White && rank == 6) || (color == Color::Black && rank == 1)) {
+                side.rook_files += 18;
+                const int enemy_back_rank = color == Color::White ? 7 : 0;
+                if (square_rank(enemy.king_square) == enemy_back_rank) {
+                    side.rook_files += 8;
+                }
+            }
+            for (int pawn_square : side.passed_pawn_squares) {
+                if (square_file(pawn_square) != file) {
+                    continue;
+                }
+                const int pawn_rank = square_rank(pawn_square);
+                if ((color == Color::White && rank < pawn_rank) ||
+                    (color == Color::Black && rank > pawn_rank)) {
+                    side.rook_files += 14;
+                    break;
+                }
+            }
         }
     };
 
-    evaluate_rooks(white, black);
-    evaluate_rooks(black, white);
+    evaluate_rooks(Color::White, white, black);
+    evaluate_rooks(Color::Black, black, white);
 
+    const int phase = std::min(24, raw_phase);
     auto evaluate_king = [&](Color color, SideEval& side, const SideEval& enemy) {
         if (side.king_square == kNoSquare) {
             return;
@@ -4037,10 +4399,27 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
             }
             if (board[make_square(shield_file, shield_rank)] == make_piece(color, PieceType::Pawn)) {
                 side.king_safety += 10;
+            } else if (phase > 8) {
+                side.king_safety -= 8;
+            }
+            const int far_shield_rank = color == Color::White ? shield_rank + 1 : shield_rank - 1;
+            if (far_shield_rank >= 0 && far_shield_rank < 8 &&
+                board[make_square(shield_file, far_shield_rank)] == make_piece(color, PieceType::Pawn)) {
+                side.king_safety += 3;
             }
         }
-        side.king_safety -= count_king_ring_attacks(position, side.king_square, opposite(color)) * 12;
-        if (enemy.material > side.material && phase_value(position) > 10) {
+        for (int open_file = std::max(0, file - 1); open_file <= std::min(7, file + 1); ++open_file) {
+            const bool friendly_pawn = side.pawn_files[open_file] > 0;
+            const bool enemy_pawn = enemy.pawn_files[open_file] > 0;
+            if (!friendly_pawn && !enemy_pawn) {
+                side.king_safety -= phase > 8 ? 20 : 6;
+            } else if (!friendly_pawn) {
+                side.king_safety -= phase > 8 ? 10 : 3;
+            }
+        }
+        const int pressure = count_king_ring_pressure(position, side.king_square, opposite(color));
+        side.king_safety -= (pressure * std::max(8, phase)) / 24;
+        if (enemy.material > side.material && phase > 10) {
             side.king_safety -= 10;
         }
     };
@@ -4048,7 +4427,6 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
     evaluate_king(Color::White, white, black);
     evaluate_king(Color::Black, black, white);
 
-    const int phase = phase_value(position);
     if (phase <= 10) {
         const int white_edge = white.material - black.material;
         const int black_edge = black.material - white.material;
@@ -4078,6 +4456,7 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
     breakdown.positional += white.passed_pawns - black.passed_pawns;
     breakdown.positional += white.rook_files - black.rook_files;
     breakdown.positional += white.bishop_pair - black.bishop_pair;
+    breakdown.positional += white.outposts - black.outposts;
     return breakdown;
 }
 
