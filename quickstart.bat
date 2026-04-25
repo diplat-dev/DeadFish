@@ -30,6 +30,23 @@ if errorlevel 1 goto :fail
 call :resolve_python
 if errorlevel 1 goto :fail
 
+if "%LAUNCH_GUI%"=="1" (
+    echo [1/6] Checking existing engine build...
+    call :engine_build_current
+    if not errorlevel 1 (
+        call :gui_runtime_available
+        if not errorlevel 1 (
+            echo Existing engine build is current. Launching GUI without rebuild.
+            call :launch_gui %*
+            set "EXIT_CODE=0"
+            goto :end
+        )
+        echo Existing engine build is current, but GUI runtime is not ready. Continuing with setup...
+    ) else (
+        echo Existing engine build is missing or stale. Rebuilding...
+    )
+)
+
 echo [1/6] Clearing generated files...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "foreach ($path in @('build', '.tmp_pydeps', '.gui_pydeps', '.wheelhouse')) { " ^
@@ -111,11 +128,7 @@ if "%LAUNCH_GUI%"=="0" (
 )
 
 echo [6/6] Launching GUI...
-if defined PYTHONW_LAUNCHER (
-    start "" "%PYTHONW_LAUNCHER%" %PYTHONW_ARGS% -m gui %*
-) else (
-    start "" "%PYTHON_LAUNCHER%" %PYTHON_ARGS% -m gui %*
-)
+call :launch_gui %*
 set "EXIT_CODE=0"
 goto :end
 
@@ -164,5 +177,38 @@ exit /b 1
 if errorlevel 1 (
     echo Python 3.10+ is required to run DeadFish tools and the GUI.
     exit /b 1
+)
+exit /b 0
+
+:engine_build_current
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$root = '%ROOT%'; " ^
+    "$artifacts = @('build\deadfish.exe', 'build\deadfish_native.exe'); " ^
+    "foreach ($artifact in $artifacts) { if (!(Test-Path (Join-Path $root $artifact))) { exit 1 } }; " ^
+    "$oldestArtifact = $artifacts | ForEach-Object { (Get-Item (Join-Path $root $_)).LastWriteTimeUtc } | Sort-Object | Select-Object -First 1; " ^
+    "$inputs = @('engine', 'cli', 'third_party\fathom', 'scripts\build_native.ps1'); " ^
+    "$latestInput = [DateTime]::MinValue; " ^
+    "foreach ($input in $inputs) { " ^
+    "  $path = Join-Path $root $input; " ^
+    "  if (!(Test-Path $path)) { continue }; " ^
+    "  $item = Get-Item $path; " ^
+    "  if ($item.PSIsContainer) { " ^
+    "    $latest = Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1; " ^
+    "    if ($null -ne $latest -and $latest.LastWriteTimeUtc -gt $latestInput) { $latestInput = $latest.LastWriteTimeUtc } " ^
+    "  } elseif ($item.LastWriteTimeUtc -gt $latestInput) { $latestInput = $item.LastWriteTimeUtc } " ^
+    "}; " ^
+    "if ($latestInput -gt $oldestArtifact) { exit 1 }; " ^
+    "exit 0"
+exit /b %ERRORLEVEL%
+
+:gui_runtime_available
+%PYTHON_LAUNCHER% %PYTHON_ARGS% -c "import gui; import chess; raise SystemExit(0 if hasattr(chess, 'Board') else 1)" >nul 2>&1
+exit /b %ERRORLEVEL%
+
+:launch_gui
+if defined PYTHONW_LAUNCHER (
+    start "" "%PYTHONW_LAUNCHER%" %PYTHONW_ARGS% -m gui %*
+) else (
+    start "" "%PYTHON_LAUNCHER%" %PYTHON_ARGS% -m gui %*
 )
 exit /b 0
