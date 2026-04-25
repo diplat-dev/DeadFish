@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -22,6 +24,38 @@ def preferred_engine_path() -> Path:
     if native.exists():
         return native
     return default_engine_path()
+
+
+def default_cutechess_path() -> str:
+    root = repo_root()
+    candidates = [
+        root / ".tmp_cutechess" / "cutechess-1.4.0" / "cutechess-1.4.0-win64" / "cutechess-cli.exe",
+        root / ".tmp_cutechess" / "run-cutechess-cli.cmd",
+        root / ".tmp_cutechess" / "cutechess-cli.exe",
+        root / ".tmp_cutechess" / "cutechess-cli",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    found = shutil.which("cutechess-cli")
+    return found or "cutechess-cli"
+
+
+def default_match_dir() -> Path:
+    path = repo_root() / ".tmp_matches"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def timestamp_slug() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def safe_slug(value: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug.strip("_") or "engine"
 
 
 def run_cli(engine_path: Path, args: list[str]) -> str:

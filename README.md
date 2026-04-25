@@ -153,13 +153,19 @@ Use cutechess for objective match testing:
 python .\scripts\external_gauntlet.py --config .\data\external_gauntlet.example.json
 ```
 
+The gauntlet runner auto-detects the repo-local `.tmp_cutechess` install when present, writes PGNs/logs/JSON summaries under `.tmp_matches`, and prints an anchored rating estimate when opponents include a `rating` field. For Stockfish limited-strength anchors, start from:
+
+```powershell
+python .\scripts\external_gauntlet.py --config .\data\stockfish_limited_gauntlet.example.json
+```
+
 For a single direct cutechess match:
 
 ```powershell
 python .\scripts\cutechess_match.py --engine-b path\to\other\engine.exe --games 20 --tc 8+0.08
 ```
 
-These scripts require `cutechess-cli` plus the target engine binaries.
+These scripts require `cutechess-cli` plus the target engine binaries. Local external engines belong under `.tmp_engines` unless they are intentionally tracked.
 
 ## UCI Usage
 
@@ -210,11 +216,11 @@ The `eval` command returns a side-to-move-relative static evaluation without run
 - `python .\scripts\selfplay_gauntlet.py --engine-b path\to\other\engine.exe`
   Runs a small opening-suite gauntlet with both color assignments using UCI.
 - `python .\scripts\cutechess_match.py --engine-b path\to\other\engine.exe`
-  Runs a configurable UCI-vs-UCI match through `cutechess-cli`, with optional openings and SPRT parameters.
+  Runs a configurable UCI-vs-UCI match through `cutechess-cli`, with optional openings, SPRT parameters, and ignored match artifacts.
 - `python .\scripts\external_gauntlet.py --config .\data\external_gauntlet.example.json`
-  Runs DeadFish against a configured engine ladder through `cutechess-cli`.
+  Runs DeadFish against a configured engine ladder through `cutechess-cli` and estimates rating from configured anchors.
 
-The cutechess-based scripts require a local `cutechess-cli` install and external engine binaries; they are not required for normal builds.
+The cutechess-based scripts require a local `cutechess-cli` install and external engine binaries; they auto-detect `.tmp_cutechess` but are not required for normal builds.
 
 ## Validation Coverage
 

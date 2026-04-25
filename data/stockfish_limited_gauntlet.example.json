@@ -1,0 +1,40 @@
+{
+  "name": "stockfish-limited-anchors",
+  "games": 200,
+  "concurrency": 4,
+  "tc": "10+0.1",
+  "artifact_dir": ".tmp_matches",
+  "opening_file": "nnue_openings.pgn",
+  "opening_format": "pgn",
+  "opening_order": "sequential",
+  "opening_plies": 8,
+  "engine_options": [
+    "Hash=64",
+    "Threads=1",
+    "OwnBook=false"
+  ],
+  "opponents": [
+    {
+      "name": "Stockfish-LS-2900",
+      "cmd": "../.tmp_stockfish/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe",
+      "rating": 2900,
+      "options": [
+        "Hash=64",
+        "Threads=1",
+        "UCI_LimitStrength=true",
+        "UCI_Elo=2900"
+      ]
+    },
+    {
+      "name": "Stockfish-LS-3000",
+      "cmd": "../.tmp_stockfish/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe",
+      "rating": 3000,
+      "options": [
+        "Hash=64",
+        "Threads=1",
+        "UCI_LimitStrength=true",
+        "UCI_Elo=3000"
+      ]
+    }
+  ]
+}

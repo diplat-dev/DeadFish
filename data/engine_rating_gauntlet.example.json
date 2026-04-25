@@ -1,0 +1,54 @@
+{
+  "name": "external-rating-anchors",
+  "games": 200,
+  "concurrency": 4,
+  "tc": "10+0.1",
+  "artifact_dir": ".tmp_matches",
+  "opening_file": "nnue_openings.pgn",
+  "opening_format": "pgn",
+  "opening_order": "sequential",
+  "opening_plies": 8,
+  "engine_options": [
+    "Hash=64",
+    "Threads=1",
+    "OwnBook=false"
+  ],
+  "opponents": [
+    {
+      "name": "Anchor-2600",
+      "cmd": "../.tmp_engines/anchor-2600/engine.exe",
+      "rating": 2600,
+      "options": [
+        "Hash=64",
+        "Threads=1"
+      ]
+    },
+    {
+      "name": "Anchor-2800",
+      "cmd": "../.tmp_engines/anchor-2800/engine.exe",
+      "rating": 2800,
+      "options": [
+        "Hash=64",
+        "Threads=1"
+      ]
+    },
+    {
+      "name": "Anchor-3000",
+      "cmd": "../.tmp_engines/anchor-3000/engine.exe",
+      "rating": 3000,
+      "options": [
+        "Hash=64",
+        "Threads=1"
+      ]
+    },
+    {
+      "name": "Anchor-3200",
+      "cmd": "../.tmp_engines/anchor-3200/engine.exe",
+      "rating": 3200,
+      "options": [
+        "Hash=64",
+        "Threads=1"
+      ]
+    }
+  ]
+}

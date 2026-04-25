@@ -2127,6 +2127,19 @@ int ensure_see(const Position& position, OrderedMove& ordered) {
     return ordered.see == kSeeUnknown ? 0 : ordered.see;
 }
 
+bool cheap_good_tactical(const Position& position, const Move& move) {
+    if (move.is_promotion()) {
+        return true;
+    }
+    if (!move.is_capture()) {
+        return false;
+    }
+    const Piece victim = captured_piece_for_move(position, move);
+    const int victim_value = piece_value(piece_type(victim));
+    const int attacker_value = move_attacker_value(position, move);
+    return victim_value >= attacker_value;
+}
+
 OrderedMove classify_move(const Position& position, const Move& move, const SearchContext& context, int ply) {
     OrderedMove ordered;
     ordered.move = move;
@@ -2137,11 +2150,8 @@ OrderedMove classify_move(const Position& position, const Move& move, const Sear
     if (move.is_capture()) {
         const int victim_value = piece_value(piece_type(victim));
         const int attacker_value = move_attacker_value(position, move);
-        if (!move.is_promotion() && victim_value < attacker_value) {
-            ordered.see = see_value(position, move);
-        }
-        const bool likely_good = ordered.see == kSeeUnknown || ordered.see >= 0;
-        ordered.score += likely_good ? kWinningSeeBonus : kLosingCaptureBase + ordered.see;
+        const bool likely_good = move.is_promotion() || victim_value >= attacker_value;
+        ordered.score += likely_good ? kWinningSeeBonus : kLosingCaptureBase;
         ordered.score += victim_value * 16 - attacker_value / 2;
         ordered.score += context.capture_history[static_cast<std::size_t>(us)][move.from][move.to] / 2;
     }
@@ -2183,23 +2193,16 @@ OrderedMove take_best_scored_move(OrderedMoveList& moves, std::size_t& index) {
 class MovePicker {
 public:
     MovePicker(const Position& position, const MoveList& moves, const Move& tt_move,
-               const SearchContext& context, int ply) {
-        good_tacticals_.reserve(moves.size());
-        quiets_.reserve(moves.size());
-        bad_tacticals_.reserve(moves.size());
+               const SearchContext& context, int ply)
+        : position_(position),
+          moves_(moves),
+          context_(context),
+          ply_(ply) {
         for (const Move& move : moves) {
             if (!tt_move.is_null() && move == tt_move) {
                 tt_move_ = move;
                 has_tt_move_ = true;
-                continue;
-            }
-            OrderedMove ordered = classify_move(position, move, context, ply);
-            if (ordered.quiet) {
-                quiets_.push_back(ordered);
-            } else if (move.is_promotion() || ordered.see == kSeeUnknown || ordered.see >= 0) {
-                good_tacticals_.push_back(ordered);
-            } else {
-                bad_tacticals_.push_back(ordered);
+                break;
             }
         }
     }
@@ -2213,10 +2216,12 @@ public:
             move.quiet = !tt_move_.is_capture() && !tt_move_.is_promotion();
             return true;
         }
+        build_tacticals();
         if (good_index_ < good_tacticals_.size()) {
             move = take_best_scored_move(good_tacticals_, good_index_);
             return true;
         }
+        build_quiets();
         if (quiet_index_ < quiets_.size()) {
             move = take_best_scored_move(quiets_, quiet_index_);
             return true;
@@ -2229,9 +2234,52 @@ public:
     }
 
 private:
+    void build_tacticals() {
+        if (tacticals_built_) {
+            return;
+        }
+        tacticals_built_ = true;
+        for (const Move& move : moves_) {
+            if (!tt_move_.is_null() && move == tt_move_) {
+                continue;
+            }
+            if (!move.is_capture() && !move.is_promotion()) {
+                continue;
+            }
+            OrderedMove ordered = classify_move(position_, move, context_, ply_);
+            if (cheap_good_tactical(position_, move)) {
+                good_tacticals_.push_back(ordered);
+            } else {
+                bad_tacticals_.push_back(ordered);
+            }
+        }
+    }
+
+    void build_quiets() {
+        if (quiets_built_) {
+            return;
+        }
+        quiets_built_ = true;
+        for (const Move& move : moves_) {
+            if (!tt_move_.is_null() && move == tt_move_) {
+                continue;
+            }
+            if (move.is_capture() || move.is_promotion()) {
+                continue;
+            }
+            quiets_.push_back(classify_move(position_, move, context_, ply_));
+        }
+    }
+
+    const Position& position_;
+    const MoveList& moves_;
+    const SearchContext& context_;
+    int ply_ = 0;
     Move tt_move_ = Move::null();
     bool has_tt_move_ = false;
     bool tt_used_ = false;
+    bool tacticals_built_ = false;
+    bool quiets_built_ = false;
     OrderedMoveList good_tacticals_{};
     OrderedMoveList quiets_{};
     OrderedMoveList bad_tacticals_{};
@@ -4716,12 +4764,12 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
         int king_square = kNoSquare;
         int bishops = 0;
         std::array<int, 8> pawn_files{};
-        std::vector<int> pawns;
-        std::vector<int> passed_pawn_squares;
-        std::vector<int> knights;
-        std::vector<int> bishop_squares;
-        std::vector<int> rooks;
-        std::vector<int> queens;
+        FixedList<int, 16> pawns;
+        FixedList<int, 16> passed_pawn_squares;
+        FixedList<int, 16> knights;
+        FixedList<int, 16> bishop_squares;
+        FixedList<int, 16> rooks;
+        FixedList<int, 16> queens;
     };
 
     SideEval white;

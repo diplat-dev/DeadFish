@@ -28,6 +28,8 @@ tools/emsdk/
 
 RUNBOOK.txt
 .tmp_stockfish/
+.tmp_engines/
+.tmp_ordo/
 .tmp_datasets/
 .tmp_baseline/
 .tmp_cutechess/
