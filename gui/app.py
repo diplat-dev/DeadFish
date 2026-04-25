@@ -316,6 +316,11 @@ class GuiApp:
         self.status_var = tk.StringVar(value=self.controller.status_text)
         self.engine_summary_var = tk.StringVar(value="No engine connected")
         self.turn_var = tk.StringVar(value="White to move")
+        self.white_clock_var = tk.StringVar(value=self.controller.clock_text(chess.WHITE))
+        self.black_clock_var = tk.StringVar(value=self.controller.clock_text(chess.BLACK))
+        self.active_engine_slot_var = tk.StringVar(value="")
+        self.white_player_var = tk.StringVar(value=self.controller.side_player_choice(chess.WHITE))
+        self.black_player_var = tk.StringVar(value=self.controller.side_player_choice(chess.BLACK))
         self.analysis_depth_var = tk.StringVar(value="-")
         self.analysis_score_var = tk.StringVar(value="-")
         self.analysis_nodes_var = tk.StringVar(value="-")
@@ -330,6 +335,8 @@ class GuiApp:
         self.play_limit_mode_var = tk.StringVar(value=self.controller.play_search_mode)
         self.play_limit_label_var = tk.StringVar(value=self._play_limit_label())
         self.play_limit_value_var = tk.StringVar(value=self._play_limit_value())
+        self.clock_base_var = tk.StringVar(value=str(self.controller.clock_base_ms // 60000))
+        self.clock_increment_var = tk.StringVar(value=str(self.controller.clock_increment_ms // 1000))
 
         self.option_vars: dict[str, tk.Variable] = {}
         self.rendered_settings_version = -1
@@ -370,7 +377,7 @@ class GuiApp:
         ttk.Label(toolbar, text="Engine", style="Toolbar.TLabel").pack(side="left")
         ttk.Entry(toolbar, textvariable=self.engine_path_var, width=72).pack(side="left", fill="x", expand=True, padx=(10, 8))
         ttk.Button(toolbar, text="Browse", command=self._browse_engine).pack(side="left", padx=(0, 6))
-        ttk.Button(toolbar, text="Load Engine", style="Accent.TButton", command=self._load_engine).pack(side="left")
+        ttk.Button(toolbar, text="Add Engine", style="Accent.TButton", command=self._load_engine).pack(side="left")
 
         body = ttk.Frame(outer, style="Panel.TFrame", padding=12)
         body.pack(fill="both", expand=True, pady=(12, 0))
@@ -408,6 +415,10 @@ class GuiApp:
         )
         ttk.Label(status_card, text="Turn", style="Title.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(status_card, textvariable=self.turn_var, style="Value.TLabel").grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(status_card, text="White Clock", style="Title.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(status_card, textvariable=self.white_clock_var, style="Value.TLabel").grid(row=2, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(status_card, text="Black Clock", style="Title.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(status_card, textvariable=self.black_clock_var, style="Value.TLabel").grid(row=3, column=1, sticky="w", pady=(8, 0))
 
         notebook = ttk.Notebook(right, style="Notebook.TNotebook")
         notebook.grid(row=1, column=0, sticky="nsew")
@@ -430,7 +441,7 @@ class GuiApp:
     def _build_info_tab(self, parent: ttk.Frame) -> None:
         control_row = ttk.Frame(parent, style="Panel.TFrame")
         control_row.pack(fill="x")
-        ttk.Checkbutton(control_row, text="Engine Replies", variable=self.play_mode_var, command=self._toggle_play_mode).pack(
+        ttk.Checkbutton(control_row, text="Engine Players", variable=self.play_mode_var, command=self._toggle_play_mode).pack(
             side="left"
         )
         ttk.Checkbutton(
@@ -439,11 +450,11 @@ class GuiApp:
             variable=self.analysis_enabled_var,
             command=self._toggle_analysis,
         ).pack(side="left", padx=(14, 0))
-        ttk.Label(control_row, text="Reply Limit").pack(side="left", padx=(18, 6))
+        ttk.Label(control_row, text="Search").pack(side="left", padx=(18, 6))
         limit_mode = ttk.Combobox(
             control_row,
             textvariable=self.play_limit_mode_var,
-            values=("movetime", "depth"),
+            values=("clock", "movetime", "nodes"),
             state="readonly",
             width=10,
         )
@@ -461,6 +472,30 @@ class GuiApp:
         self.play_limit_spinbox.bind("<FocusOut>", lambda _event: self._apply_play_limit_value())
         self.play_limit_spinbox.bind("<Return>", lambda _event: self._apply_play_limit_value())
         self._sync_play_limit_widget()
+
+        player_row = ttk.Frame(parent, style="Panel.TFrame")
+        player_row.pack(fill="x", pady=(12, 0))
+        ttk.Label(player_row, text="White").pack(side="left")
+        self.white_player_combo = ttk.Combobox(
+            player_row,
+            textvariable=self.white_player_var,
+            values=self.controller.player_choices(),
+            state="readonly",
+            width=22,
+        )
+        self.white_player_combo.pack(side="left", padx=(6, 12))
+        self.white_player_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_side_players())
+        ttk.Label(player_row, text="Black").pack(side="left")
+        self.black_player_combo = ttk.Combobox(
+            player_row,
+            textvariable=self.black_player_var,
+            values=self.controller.player_choices(),
+            state="readonly",
+            width=22,
+        )
+        self.black_player_combo.pack(side="left", padx=(6, 12))
+        self.black_player_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_side_players())
+        ttk.Button(player_row, text="Switch", command=self._switch_sides).pack(side="left")
 
         metrics = ttk.Frame(parent, style="Panel.TFrame")
         metrics.pack(fill="x", pady=(14, 10))
@@ -553,7 +588,7 @@ class GuiApp:
             if default_engine is not None:
                 text = str(default_engine)
                 self.engine_path_var.set(text)
-        if not self.controller.connect_engine(text or None):
+        if self.controller.add_engine_slot(text or None) is None:
             messagebox.showerror("Engine Load Failed", self.controller.status_text, parent=self.root)
 
     def _toggle_play_mode(self) -> None:
@@ -566,20 +601,28 @@ class GuiApp:
         self.controller.set_analysis_enabled(self.analysis_enabled_var.get())
 
     def _play_limit_label(self) -> str:
-        return "Movetime (ms)" if self.controller.play_search_mode == "movetime" else "Depth"
+        if self.controller.play_search_mode == "movetime":
+            return "Movetime (ms)"
+        if self.controller.play_search_mode == "nodes":
+            return "Nodes"
+        return "Clock"
 
     def _play_limit_value(self) -> str:
         if self.controller.play_search_mode == "movetime":
             return str(self.controller.move_time_ms)
-        return str(self.controller.search_depth)
+        if self.controller.play_search_mode == "nodes":
+            return str(self.controller.node_limit)
+        return f"{self.controller.clock_base_ms // 60000}+{self.controller.clock_increment_ms // 1000}"
 
     def _sync_play_limit_widget(self) -> None:
         if not hasattr(self, "play_limit_spinbox"):
             return
         if self.controller.play_search_mode == "movetime":
-            self.play_limit_spinbox.configure(from_=1, to=600000)
+            self.play_limit_spinbox.configure(from_=1, to=600000, state="normal")
+        elif self.controller.play_search_mode == "nodes":
+            self.play_limit_spinbox.configure(from_=1, to=100000000, state="normal")
         else:
-            self.play_limit_spinbox.configure(from_=1, to=100)
+            self.play_limit_spinbox.configure(from_=1, to=1, state="disabled")
         self.play_limit_label_var.set(self._play_limit_label())
         self.play_limit_value_var.set(self._play_limit_value())
 
@@ -591,9 +634,25 @@ class GuiApp:
     def _apply_play_limit_value(self) -> None:
         if self.controller.play_search_mode == "movetime":
             self.controller.set_move_time_ms(self.play_limit_value_var.get())
-        else:
-            self.controller.set_search_depth(self.play_limit_value_var.get())
+        elif self.controller.play_search_mode == "nodes":
+            self.controller.set_node_limit(self.play_limit_value_var.get())
         self._sync_play_limit_widget()
+
+    def _apply_clock_settings(self) -> None:
+        self.controller.set_clock(self.clock_base_var.get(), self.clock_increment_var.get())
+        if focus_widget is not getattr(self, "clock_base_spinbox", None):
+            self.clock_base_var.set(str(self.controller.clock_base_ms // 60000))
+        if focus_widget is not getattr(self, "clock_increment_spinbox", None):
+            self.clock_increment_var.set(str(self.controller.clock_increment_ms // 1000))
+
+    def _apply_side_players(self) -> None:
+        self.controller.set_side_player_from_choice(chess.WHITE, self.white_player_var.get())
+        self.controller.set_side_player_from_choice(chess.BLACK, self.black_player_var.get())
+
+    def _switch_sides(self) -> None:
+        self.controller.switch_sides()
+        self.white_player_var.set(self.controller.side_player_choice(chess.WHITE))
+        self.black_player_var.set(self.controller.side_player_choice(chess.BLACK))
 
     def _toggle_flip(self) -> None:
         self.flipped_var.set(not self.flipped_var.get())
@@ -666,12 +725,62 @@ class GuiApp:
             child.destroy()
         self.option_vars.clear()
 
-        gui_row = ttk.Frame(self.settings_inner, style="Panel.TFrame", padding=(0, 4, 0, 10))
-        gui_row.pack(fill="x")
-        ttk.Label(gui_row, text="GUI Behavior", style="Title.TLabel").pack(anchor="w")
+        engine_row = ttk.Frame(self.settings_inner, style="Panel.TFrame", padding=(0, 4, 0, 10))
+        engine_row.pack(fill="x")
+        ttk.Label(engine_row, text="Engine Slots", style="InfoHeader.TLabel").pack(anchor="w")
+        slot_choices = self.controller.engine_slot_choices()
+        if slot_choices:
+            self.active_engine_slot_var.set(self.controller.active_slot_choice())
+            ttk.Label(engine_row, text="Active settings engine", style="Title.TLabel").pack(anchor="w", pady=(6, 0))
+            active_combo = ttk.Combobox(
+                engine_row,
+                textvariable=self.active_engine_slot_var,
+                values=slot_choices,
+                state="readonly",
+                width=34,
+            )
+            active_combo.pack(anchor="w", pady=(3, 0))
+            active_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_active_engine_slot())
+        else:
+            ttk.Label(engine_row, text="Add an engine to create a White or Black slot.", style="Title.TLabel").pack(
+                anchor="w",
+                pady=(6, 0),
+            )
+
+        game_row = ttk.Frame(self.settings_inner, style="Panel.TFrame", padding=(0, 4, 0, 10))
+        game_row.pack(fill="x")
+        ttk.Label(game_row, text="Game", style="InfoHeader.TLabel").pack(anchor="w")
+        players = ttk.Frame(game_row, style="Panel.TFrame")
+        players.pack(fill="x", pady=(6, 0))
+        ttk.Label(players, text="White", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            players,
+            textvariable=self.white_player_var,
+            values=self.controller.player_choices(),
+            state="readonly",
+            width=24,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(players, text="Black", style="Title.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Combobox(
+            players,
+            textvariable=self.black_player_var,
+            values=self.controller.player_choices(),
+            state="readonly",
+            width=24,
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(players, text="Apply Players", command=self._apply_side_players).grid(row=1, column=2, sticky="w")
+        clock = ttk.Frame(game_row, style="Panel.TFrame")
+        clock.pack(fill="x", pady=(10, 0))
+        ttk.Label(clock, text="Base min", style="Title.TLabel").pack(side="left")
+        self.clock_base_spinbox = ttk.Spinbox(clock, from_=1, to=600, width=8, textvariable=self.clock_base_var)
+        self.clock_base_spinbox.pack(side="left", padx=(6, 12))
+        ttk.Label(clock, text="Increment sec", style="Title.TLabel").pack(side="left")
+        self.clock_increment_spinbox = ttk.Spinbox(clock, from_=0, to=600, width=8, textvariable=self.clock_increment_var)
+        self.clock_increment_spinbox.pack(side="left", padx=(6, 12))
+        ttk.Button(clock, text="Apply Clock", command=self._apply_clock_settings).pack(side="left")
         ttk.Checkbutton(
-            gui_row,
-            text="Think On Opponent Turn",
+            game_row,
+            text="Think On Human Turn",
             variable=self.think_on_opponent_turn_var,
             command=self._toggle_think_on_opponent_turn,
         ).pack(anchor="w", pady=(6, 0))
@@ -680,66 +789,79 @@ class GuiApp:
         if not self.controller.engine_options:
             ttk.Label(
                 self.settings_inner,
-                text="Load an engine to view its advertised UCI options.",
+                text="Select a ready engine slot to view its advertised UCI options.",
                 style="Title.TLabel",
             ).pack(anchor="w", pady=(4, 0))
             self.rendered_settings_version = self.controller.settings_version
             return
 
-        for option in self.controller.engine_options.values():
-            row = ttk.Frame(self.settings_inner, style="Panel.TFrame", padding=(0, 6))
-            row.pack(fill="x")
-            ttk.Label(row, text=option.name, style="Title.TLabel").pack(anchor="w")
-            if option.kind == "button":
-                ttk.Button(
-                    row,
-                    text=option.name,
-                    command=lambda name=option.name: self.controller.press_button_option(name),
-                ).pack(anchor="w", pady=(4, 0))
-                continue
+        core_names = {"Threads", "Hash", "MoveOverhead", "OwnBook", "UseNNUE"}
+        core_options = [option for option in self.controller.engine_options.values() if option.name in core_names]
+        advanced_options = [option for option in self.controller.engine_options.values() if option.name not in core_names]
 
-            current_value = self.controller.draft_option_values.get(option.name, option_default_value(option))
-            widget_frame = ttk.Frame(row, style="Panel.TFrame")
-            widget_frame.pack(fill="x", pady=(4, 0))
-            variable: tk.Variable
+        ttk.Label(self.settings_inner, text="Core Engine Options", style="InfoHeader.TLabel").pack(anchor="w")
+        for option in core_options:
+            self._render_option_row(option)
 
-            if option.kind == "check":
-                variable = tk.BooleanVar(value=bool(current_value))
-                ttk.Checkbutton(widget_frame, variable=variable).pack(side="left")
-            elif option.kind == "spin":
-                variable = tk.StringVar(value=str(current_value))
-                ttk.Spinbox(
-                    widget_frame,
-                    from_=option.minimum if option.minimum is not None else -999999,
-                    to=option.maximum if option.maximum is not None else 999999,
-                    textvariable=variable,
-                    width=10,
-                ).pack(side="left")
-                ttk.Label(
-                    widget_frame,
-                    text=f"{option.minimum if option.minimum is not None else '-inf'} to {option.maximum if option.maximum is not None else '+inf'}",
-                    style="Title.TLabel",
-                ).pack(side="left", padx=(8, 0))
-            elif option.kind == "combo":
-                variable = tk.StringVar(value=str(current_value))
-                ttk.Combobox(widget_frame, textvariable=variable, values=option.vars, state="readonly").pack(
-                    side="left",
-                    fill="x",
-                    expand=True,
-                )
-            else:
-                variable = tk.StringVar(value=str(current_value))
-                ttk.Entry(widget_frame, textvariable=variable).pack(side="left", fill="x", expand=True)
-                picker = self._picker_callback(option)
-                if picker is not None:
-                    ttk.Button(widget_frame, text="Browse", command=picker).pack(side="left", padx=(8, 0))
-            self.option_vars[option.name] = variable
+        ttk.Separator(self.settings_inner, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(self.settings_inner, text="Advanced UCI Options", style="InfoHeader.TLabel").pack(anchor="w")
+        for option in advanced_options:
+            self._render_option_row(option)
 
         ttk.Separator(self.settings_inner, orient="horizontal").pack(fill="x", pady=10)
         ttk.Button(self.settings_inner, text="Apply Settings", style="Accent.TButton", command=self._apply_settings).pack(
             anchor="e"
         )
         self.rendered_settings_version = self.controller.settings_version
+
+    def _render_option_row(self, option: UciOption) -> None:
+        row = ttk.Frame(self.settings_inner, style="Panel.TFrame", padding=(0, 6))
+        row.pack(fill="x")
+        ttk.Label(row, text=option.name, style="Title.TLabel").pack(anchor="w")
+        if option.kind == "button":
+            ttk.Button(
+                row,
+                text=option.name,
+                command=lambda name=option.name: self.controller.press_button_option(name),
+            ).pack(anchor="w", pady=(4, 0))
+            return
+
+        current_value = self.controller.draft_option_values.get(option.name, option_default_value(option))
+        widget_frame = ttk.Frame(row, style="Panel.TFrame")
+        widget_frame.pack(fill="x", pady=(4, 0))
+        variable: tk.Variable
+
+        if option.kind == "check":
+            variable = tk.BooleanVar(value=bool(current_value))
+            ttk.Checkbutton(widget_frame, variable=variable).pack(side="left")
+        elif option.kind == "spin":
+            variable = tk.StringVar(value=str(current_value))
+            ttk.Spinbox(
+                widget_frame,
+                from_=option.minimum if option.minimum is not None else -999999,
+                to=option.maximum if option.maximum is not None else 999999,
+                textvariable=variable,
+                width=10,
+            ).pack(side="left")
+            ttk.Label(
+                widget_frame,
+                text=f"{option.minimum if option.minimum is not None else '-inf'} to {option.maximum if option.maximum is not None else '+inf'}",
+                style="Title.TLabel",
+            ).pack(side="left", padx=(8, 0))
+        elif option.kind == "combo":
+            variable = tk.StringVar(value=str(current_value))
+            ttk.Combobox(widget_frame, textvariable=variable, values=option.vars, state="readonly").pack(
+                side="left",
+                fill="x",
+                expand=True,
+            )
+        else:
+            variable = tk.StringVar(value=str(current_value))
+            ttk.Entry(widget_frame, textvariable=variable).pack(side="left", fill="x", expand=True)
+            picker = self._picker_callback(option)
+            if picker is not None:
+                ttk.Button(widget_frame, text="Browse", command=picker).pack(side="left", padx=(8, 0))
+        self.option_vars[option.name] = variable
 
     def _picker_callback(self, option: UciOption):
         name = option.name.casefold()
@@ -769,6 +891,9 @@ class GuiApp:
         payload = {name: variable.get() for name, variable in self.option_vars.items()}
         self.controller.apply_option_drafts(payload)
 
+    def _apply_active_engine_slot(self) -> None:
+        self.controller.set_active_slot_from_choice(self.active_engine_slot_var.get())
+
     def _set_readonly_text(self, widget: tk.Text, text: str) -> None:
         widget.configure(state="normal")
         widget.delete("1.0", "end")
@@ -787,10 +912,8 @@ class GuiApp:
             return f"{side} to move (engine thinking)"
         if self.controller.search_kind == "ponder":
             return f"{side} to move (background thinking)"
-        if self.controller.play_mode and self.controller.board.turn != self.controller.human_color:
+        if self.controller.play_mode and not self.controller.is_human_turn():
             return f"{side} to move (waiting for engine)"
-        if not self.controller.play_mode and self.controller.board.turn != self.controller.human_color:
-            return f"{side} to move (engine replies paused)"
         return f"{side} to move"
 
     def _refresh_ui(self) -> None:
@@ -800,8 +923,14 @@ class GuiApp:
             self.controller.engine_path.name if self.controller.engine_path else "None"
         )
         engine_author = self.controller.engine_identity.author
-        self.engine_summary_var.set(f"{engine_name} by {engine_author}" if engine_author else engine_name)
+        slot_count = len(self.controller.engine_slots)
+        summary = f"{engine_name} by {engine_author}" if engine_author else engine_name
+        if slot_count:
+            summary = f"{summary} ({slot_count} slot{'s' if slot_count != 1 else ''})"
+        self.engine_summary_var.set(summary)
         self.turn_var.set(self._turn_text())
+        self.white_clock_var.set(self.controller.clock_text(chess.WHITE))
+        self.black_clock_var.set(self.controller.clock_text(chess.BLACK))
         self.analysis_depth_var.set(str(self.controller.analysis.depth or "-"))
         self.analysis_score_var.set(self.controller.analysis.score_text or "-")
         self.analysis_nodes_var.set(f"{self.controller.analysis.nodes:,}" if self.controller.analysis.nodes else "-")
@@ -813,6 +942,17 @@ class GuiApp:
         self.think_on_opponent_turn_var.set(self.controller.think_on_opponent_turn)
         self.analysis_enabled_var.set(self.controller.analysis_enabled)
         self.play_limit_label_var.set(self._play_limit_label())
+        player_choices = self.controller.player_choices()
+        if hasattr(self, "white_player_combo"):
+            self.white_player_combo.configure(values=player_choices)
+            self.black_player_combo.configure(values=player_choices)
+        if focus_widget not in {getattr(self, "white_player_combo", None), getattr(self, "black_player_combo", None)}:
+            self.white_player_var.set(self.controller.side_player_choice(chess.WHITE))
+            self.black_player_var.set(self.controller.side_player_choice(chess.BLACK))
+        if focus_widget is not getattr(self, "active_engine_slot_var", None):
+            self.active_engine_slot_var.set(self.controller.active_slot_choice())
+        self.clock_base_var.set(str(self.controller.clock_base_ms // 60000))
+        self.clock_increment_var.set(str(self.controller.clock_increment_ms // 1000))
         if focus_widget is not getattr(self, "play_limit_mode_combo", None):
             self.play_limit_mode_var.set(self.controller.play_search_mode)
         if focus_widget is not getattr(self, "play_limit_spinbox", None):

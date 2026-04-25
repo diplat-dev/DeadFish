@@ -1,32 +1,33 @@
 # DeadFish
 
-DeadFish is a native-first C++ chess engine with a CLI harness, a minimal UCI frontend, and a growing strength-development toolchain around profiling, gauntlets, and NNUE training.
+DeadFish is a native-first C++ chess engine with a CLI harness, UCI support, a Windows-focused Tkinter GUI, and repeatable tooling for profiling and match testing.
 
-The browser/WebAssembly path has been intentionally removed so the active codebase can focus on native engine strength work.
+The browser/WebAssembly path has been intentionally removed so the active codebase can stay focused on native engine strength work.
 
 ## Features
 
-- Custom bitboard engine core with fixed-capacity search move lists, pseudo-legal hot-path move generation, compact delta make/unmake, repetition tracking, and full Zobrist hashing
-- Iterative deepening with alpha-beta, aspiration windows, PVS, quiescence, verified null-move pruning, probcut, razoring, adaptive LMR, singular-style TT move extension, killer/history/countermove/continuation heuristics, SEE-based move handling, a clustered fixed-size TT, and Lazy SMP multi-threading
+- Custom bitboard engine core with fixed-capacity search move lists, pseudo-legal hot-path move generation, compact make/unmake, repetition tracking, and full Zobrist hashing
+- Iterative deepening search with alpha-beta, aspiration windows, PVS, quiescence, null-move pruning, probcut, razoring, adaptive LMR, singular-style TT move extension, killer/history/countermove/continuation heuristics, SEE-aware move handling, a clustered TT, and thread-aware Lazy SMP
 - Classical tapered evaluation with material, piece-square terms, mobility, king safety, pawn structure, passed pawns, threats, space, activity, outposts, rook file/7th-rank bonuses, endgame scaling, simplification, and tempo
-- Engine-side float32 `DFNNUE1` inference with search-local accumulators, plus safe fallback to classical eval when no network is loaded
-- Minimal UCI support for `uci`, `isready`, `ucinewgame`, `position`, `go depth`, `go nodes`, `go movetime`, `go wtime/btime/winc/binc/movestogo`, `go infinite`, `stop`, `quit`, and engine options
-- Windows-first Tkinter UCI GUI with play mode, live analysis, FEN tools, and dynamic UCI option editing
+- UCI support for standard GUI play, fixed-depth search, node limits, movetime, clock-managed games, infinite analysis, stop, and engine options
+- Windows-first Tkinter GUI with live analysis, White/Black player slots, clock games, FEN tools, PGN notation, and dynamic UCI option editing
 - Bundled Polyglot opening-book support through `data/book.bin`
 - Syzygy probing through vendored [Fathom](./third_party/fathom/README.md) with external tablebase files
-- Native CLI commands for `play`, `search`, `perft`, `legal`, `status`, `fen`, and `bench`
-- Python-based strength tooling for tactical regression, generic-vs-native profiling, cutechess gauntlets, self-play PGN generation, and first-pass NNUE data/training/export flow
+- Native CLI commands for `play`, `search`, `perft`, `legal`, `status`, `fen`, `eval`, and `bench`
+- Python tooling for tactical regression, generic-vs-native profiling, thread scaling, self-play, and cutechess gauntlets
+
+Neural-eval and training details live in [NNUE.md](./NNUE.md).
 
 ## Repository Layout
 
-- `engine/`: core chess engine, search, and evaluation
+- `engine/`: core chess engine, search, evaluation, UCI-facing engine state, and optional tablebase integration
 - `cli/`: native CLI and UCI entrypoint
-- `data/`: bundled runtime assets and example gauntlet configuration
+- `data/`: bundled runtime assets, tactical suites, opening suites, and example gauntlet configuration
 - `gui/`: Tkinter UCI GUI, controller, and protocol client
+- `scripts/`: build helpers, smoke tests, profiling tools, match runners, and gauntlet wrappers
 - `tests/`: native correctness and search regression tests
 - `third_party/fathom/`: vendored Syzygy probing backend
-- `scripts/`: build helpers, UCI smoke tests, bench tools, and gauntlet wrappers
-- `training/`: NNUE data extraction, score annotation, training, and export pipeline
+- `training/`: neural-eval data and training pipeline; see [NNUE.md](./NNUE.md)
 
 ## Requirements
 
@@ -34,24 +35,21 @@ The browser/WebAssembly path has been intentionally removed so the active codeba
 - Scripted smoke and workflow helpers: Python 3
 - Optional GUI runtime: `python-chess` via `gui/requirements.txt`
 - Optional match tooling: `cutechess-cli`
-- Optional NNUE training pipeline: PyTorch, NumPy, and `python-chess` via `training/requirements.txt`
 
 No environment variables or `.env` file are required for normal development or use.
 
-## Native Build And Test
+## Build And Test
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_native.ps1
 .\build\deadfish_tests.exe
-.\build\deadfish.exe
-.\build\deadfish.exe search --depth 5
 python .\scripts\uci_smoke.py
 python .\scripts\tactical_suite.py
 ```
 
 The native build script looks for `clang++` on `PATH` first, falls back to the default LLVM install path on Windows, and automatically enables Syzygy probing when `third_party/fathom/` is present.
 
-It also supports a generic release build, a native-tuned build, or both:
+It can build the generic release target, the local native-tuned target, or both:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_native.ps1 -Target Generic
@@ -77,17 +75,19 @@ python -m gui --engine path\to\other-uci-engine.exe
 .\quickstart.bat
 ```
 
-The GUI defaults to `build/deadfish_native.exe` when present, falls back to `build/deadfish.exe`, and can also browse to any other UCI engine executable. It supports:
+The GUI defaults to `build/deadfish_native.exe` when present, falls back to `build/deadfish.exe`, and can browse to any other UCI engine executable. It supports:
 
 - click or drag piece movement with promotion prompts
-- live analysis via `go infinite`
-- human-vs-engine play with a configurable movetime or depth reply limit
-- optional background thinking on your turn, enabled by default and toggleable in the GUI settings
+- live analysis through `go infinite`
+- White/Black player slots where each side can be human or any loaded UCI engine
+- clock games using `go wtime/btime/winc/binc`, plus fixed movetime and node-limited move modes
+- optional background thinking on human turns
+- standard PGN/SAN notation in the side panel
 - FEN load/copy, board flip, and reset/new-game controls
-- dynamic UCI settings for `check`, `spin`, `string`, `button`, and `combo` options
-- engine log output, including DeadFish NNUE load and fallback status messages
+- grouped core and advanced UCI settings
+- engine log output
 
-For a controller/protocol smoke check that covers both a fake generic UCI engine and DeadFish itself:
+For a controller/protocol smoke check:
 
 ```powershell
 python .\scripts\gui_smoke.py
@@ -100,13 +100,11 @@ For a one-command Windows workflow that clears generated files, rebuilds DeadFis
 .\quickstart.bat --no-launch
 ```
 
-On Windows, you can also simply double-click [`quickstart.bat`](./quickstart.bat). It will rebuild and verify the engine, prepare the GUI runtime automatically, and then open the GUI once everything is ready.
-
 ## Recommended Workflows
 
-### 1. Edit-build-verify loop
+### Edit-build-verify loop
 
-Use this after engine or search changes:
+Use this after engine, search, GUI, or protocol changes:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_native.ps1 -Target All
@@ -114,77 +112,48 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_native.ps1 -Target All
 .\build\deadfish_tests_native.exe
 python .\scripts\uci_smoke.py
 python .\scripts\tactical_suite.py
+python .\scripts\gui_smoke.py
 ```
 
-This is the default "did I break anything?" workflow. If these pass, the native engine is still in a good baseline state.
+### Lightweight speed check
 
-### 2. Lightweight speed check
-
-Use this after hot-path or compiler-flag changes:
+Use this after hot-path, search, or compiler-flag changes:
 
 ```powershell
 python .\scripts\profile_bench.py --repeat 5
+python .\scripts\thread_scaling.py --movetime 1000 --threads 1,2,4,8,12,16,20
 ```
 
-This compares `build/deadfish.exe` and `build/deadfish_native.exe` on the fixed bench suite. For one-off executable comparisons against another build, use:
+`profile_bench.py` compares `build/deadfish.exe` and `build/deadfish_native.exe` on the fixed bench suite. `thread_scaling.py` drives UCI directly and reports depth, nodes, NPS, and best move across thread counts.
+
+For one-off executable comparisons against another build:
 
 ```powershell
 python .\scripts\bench_compare.py --engine-b path\to\other\engine.exe
 ```
 
-### 3. NNUE parity check
+### Internal engine match
 
-Use this before benchmarking any exported net:
-
-```powershell
-python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue
-```
-
-This compares Python checkpoint inference, exported `.nnue` inference, and `deadfish eval` on the same FENs. It should pass before you trust match results.
-
-### 4. NNUE sanity and holdout report
-
-Use this after parity and before match play:
+Use this when comparing two DeadFish builds quickly:
 
 ```powershell
-python .\scripts\nnue_eval_report.py --eval-file .\training\output\deadfish.nnue --teacher-engine .\.tmp_stockfish\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe --teacher-nodes 50000 --input .\training\output\positions_stockfish.jsonl
+python .\scripts\selfplay_gauntlet.py --engine-b path\to\other\deadfish.exe --movetime 75 --threads-a 20 --threads-b 20
 ```
 
-This compares teacher, classical, and NNUE static eval on a fixed sanity suite plus a sampled teacher-labeled holdout set. It also inspects one-ply child positions from the sanity suite so root-only parity is not the only signal.
+This is a quick regression check, not a replacement for a serious Elo run.
 
-### 5. Standard NNUE gate
+### External engine ladder
 
-Use this for classical-vs-NNUE checks with a fixed balanced opening suite:
+Use cutechess for objective match testing:
 
-```powershell
-python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode quick
-python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode strength --require-positive
-```
-
-`quick` is a fast smoke gate. `strength` is the first real acceptance gate. Both use `data/nnue_openings.pgn` instead of training self-play games.
-
-### 6. Small internal engine match
-
-Use this when comparing two DeadFish builds:
-
-```powershell
-python .\scripts\selfplay_gauntlet.py --engine-b path\to\other\deadfish.exe --movetime 75
-```
-
-This is a quick native regression check, not a replacement for a serious Elo run.
-
-### 7. External engine ladder
-
-Use this when comparing DeadFish against a small known ladder:
-
-1. Edit [`data/external_gauntlet.example.json`](./data/external_gauntlet.example.json) so the engine paths match your local installs.
+1. Edit [`data/external_gauntlet.example.json`](./data/external_gauntlet.example.json) so engine paths match your local installs.
 2. Run:
 
 ```powershell
 python .\scripts\external_gauntlet.py --config .\data\external_gauntlet.example.json
 ```
 
-For a single direct cutechess match instead of the whole ladder:
+For a single direct cutechess match:
 
 ```powershell
 python .\scripts\cutechess_match.py --engine-b path\to\other\engine.exe --games 20 --tc 8+0.08
@@ -196,49 +165,23 @@ These scripts require `cutechess-cli` plus the target engine binaries.
 
 Run `.\build\deadfish.exe` without arguments to enter the UCI loop. The engine also supports `.\build\deadfish.exe uci` explicitly.
 
-Implemented UCI options:
+Common UCI options:
 
 - `Hash`
 - `Threads`
 - `Clear Hash`
-- `UseNNUE`
-- `EvalFile`
 - `OwnBook`
 - `BookPath`
 - `SyzygyPath`
 - `SyzygyProbeLimit`
 - `MoveOverhead`
 
-`Threads` defaults to `1`, so DeadFish stays on the original single-threaded path unless you explicitly raise it. `UseNNUE` defaults to `false`, so DeadFish starts in classical mode unless you explicitly enable NNUE and load a valid network through `EvalFile`. If `EvalFile` is empty, missing, unreadable, or invalid, DeadFish stays fully usable and falls back to the classical evaluator.
-
-Current note:
-the NNUE pipeline is still experimental, and current trained nets have been underperforming the classical evaluator in match play even when parity and loader checks pass. For normal use, classical mode is the built-in default.
-
-Example:
-
-```text
-setoption name EvalFile value C:\path\to\deadfish.nnue
-setoption name UseNNUE value true
-isready
-```
-
-To force classical mode and keep NNUE from interfering:
-
-```text
-setoption name UseNNUE value false
-setoption name EvalFile value
-isready
-```
-
-In a UCI GUI, the default setup is already the safe setup:
-
-- `UseNNUE` starts as `false`
-- leave `EvalFile` empty unless you explicitly want NNUE
+`Threads` defaults to `1`. When it is raised, DeadFish chooses an internal thread plan based on root move count, clock/node budget, and requested thread count. High-count runs such as `Threads=20` mix full-depth Lazy SMP workers with lagged helper searches instead of blindly duplicating every worker.
 
 ## CLI Commands
 
 - `search [--fen FEN] [--depth N] [--movetime MS] [--threads N] [--json]`
-- `eval [--fen FEN] [--moves uci,uci,...] [--json] [--use-nnue BOOL] [--eval-file PATH]`
+- `eval [--fen FEN] [--moves uci,uci,...] [--json]`
 - `perft [--fen FEN] --depth N [--divide]`
 - `legal [--fen FEN]`
 - `status [--fen FEN] [--moves uci,uci,...] [--json]`
@@ -248,26 +191,20 @@ In a UCI GUI, the default setup is already the safe setup:
 
 The `status` command is useful for automation and returns JSON with side-to-move, check, mate, stalemate, draw, and legal-move counts when used with `--json`.
 
-The `eval` command is useful for NNUE debugging and parity checks. It returns the side-to-move-relative static evaluation without running search.
+The `eval` command returns a side-to-move-relative static evaluation without running search.
 
 ## Workflow Scripts
 
 - `python .\scripts\uci_smoke.py`
-  Verifies the UCI handshake, runtime options, NNUE load/unload fallback, depth search, movetime search, and `go infinite` / `stop`.
+  Verifies the UCI handshake, runtime options, depth search, movetime search, and `go infinite` / `stop`.
 - `python .\scripts\gui_smoke.py`
-  Verifies GUI controller flows against both a fake UCI engine and DeadFish, including dynamic options, analysis, engine replies, promotions, FEN reset, and invalid-option fallback logging.
+  Verifies GUI controller flows against both a fake UCI engine and DeadFish, including multi-engine slots, clock games, node-limited moves, PGN notation, dynamic options, analysis, promotions, FEN reset, and invalid-option fallback logging.
 - `python .\scripts\bench_compare.py --engine-b path\to\other\engine.exe`
   Runs the fixed native bench suite on two executables and compares time and NPS.
 - `python .\scripts\profile_bench.py --repeat 5`
-  Compares the generic and native-tuned DeadFish builds on the fixed bench suite and reports elapsed-time and NPS speedups.
-- `python .\scripts\nnue_parity.py --checkpoint .\training\checkpoints\deadfish_nnue.pt --eval-file .\training\output\deadfish.nnue`
-  Verifies that the Python checkpoint, exported `.nnue`, and engine runtime agree within a small centipawn tolerance on a fixed FEN suite plus sampled JSONL positions.
-- `python .\scripts\nnue_eval_report.py --eval-file .\training\output\deadfish.nnue --teacher-engine path\to\stockfish.exe --input .\training\output\positions_stockfish.jsonl`
-  Compares teacher, classical, and NNUE eval on the fixed sanity suite and a sampled holdout, including one-ply child positions and score-distribution summaries.
-- `python .\scripts\nnue_benchmark.py --eval-file .\training\output\deadfish.nnue --mode quick`
-  Runs the standardized classical-vs-NNUE benchmark gate with `data/nnue_openings.pgn`.
-- `python .\scripts\teacher_holdout.py --input .\training\output\positions_annotated.jsonl --eval-file .\training\output\deadfish.nnue --mode both`
-  Compares DeadFish classical and NNUE static eval against teacher `score_cp` labels on a sampled holdout set before match play.
+  Compares generic and native-tuned DeadFish builds on the fixed bench suite.
+- `python .\scripts\thread_scaling.py --movetime 1000 --threads 1,2,4,8,12,16,20`
+  Measures UCI thread scaling for one engine with fixed Hash across selected thread counts.
 - `python .\scripts\tactical_suite.py`
   Runs the fixed tactical regression suite in [`data/tactical_suite.txt`](./data/tactical_suite.txt).
 - `python .\scripts\selfplay_gauntlet.py --engine-b path\to\other\engine.exe`
@@ -277,74 +214,9 @@ The `eval` command is useful for NNUE debugging and parity checks. It returns th
 - `python .\scripts\external_gauntlet.py --config .\data\external_gauntlet.example.json`
   Runs DeadFish against a configured engine ladder through `cutechess-cli`.
 
-The `cutechess`-based scripts require a local `cutechess-cli` install and external engine binaries; they are included as measurement tooling and are not required for normal builds.
+The cutechess-based scripts require a local `cutechess-cli` install and external engine binaries; they are not required for normal builds.
 
-## Current Classical Strength Snapshot
-
-The current classical engine is the default path (`UseNNUE=false`) and is the recommended baseline for strength testing. Recent local measurements at `Hash=64`, `Threads=1`, `OwnBook=false`, `UseNNUE=false`, and `1+0.01`:
-
-- fixed-depth bench versus commit `11f5b93`: about `2.1x` generic and `2.4x` native faster by elapsed time
-- start position, 1 second, no book: depth 13 at roughly `435k` NPS versus `11f5b93` at roughly `352k` NPS
-- 100-game cutechess match versus `11f5b93`: `53W 39D 8L`, about `+168 Elo`, LOS `100%`
-- quick Stockfish 18 limited-strength ladder: roughly `2110-2130` on that local ladder
-
-The Stockfish limited-strength number is a practical regression yardstick, not a CCRL/FIDE-equivalent rating. For publishable strength claims, run a larger gauntlet against fixed-version engines with known rating-list anchors.
-
-## Training Toolkit
-
-The NNUE data and training flow lives under [`training/`](./training/README.md). It currently includes:
-
-- `generate_selfplay_pgn.py`
-  Generates DeadFish self-play PGNs through `cutechess-cli`.
-- `extract_positions.py`
-  Samples JSONL training positions from PGN games.
-- `annotate_positions.py`
-  Annotates JSONL positions with scores from a generic UCI teacher using depth, movetime, or fixed nodes.
-- `train_nnue.py`
-  Trains a first-pass HalfKP-style NNUE checkpoint in PyTorch.
-- `export_nnue.py`
-  Exports the checkpoint to a custom DeadFish `.nnue` binary.
-- `train_selfplay_hybrid.bat`
-  Runs a full hybrid-residual self-play batch from build to quick benchmark.
-
-The native engine can now load exported `DFNNUE1` networks directly through `EvalFile` and switch them on or off through `UseNNUE`.
-
-The recommended NNUE workflow is:
-
-1. Collect imported PGNs.
-2. Extract sampled positions to JSONL.
-3. Annotate them with Stockfish using a fixed node budget.
-4. Train a checkpoint in PyTorch with `--target-mode teacher-cp`.
-5. Export a `.nnue` blob.
-6. Run the parity check.
-7. Run the sanity and holdout report.
-8. Benchmark classical vs NNUE with the fixed opening suite.
-9. Only after the internal gate is positive, run the external ladder.
-
-See [`training/README.md`](./training/README.md) for the exact commands and file flow.
-
-For the current hybrid branch, the simplest one-command loop is:
-
-```powershell
-.\train_selfplay_hybrid.bat
-```
-
-That defaults to `500` self-play games, a `20`-worker budget, a classical teacher at `50000` nodes, `8` epochs, and a `1+0.01` self-play time control. The batch helper turns that worker budget into `10` concurrent self-play games so it does not oversubscribe the machine with `40` engine processes. It trains a `classical_backbone + nnue_residual` candidate, exports it, runs parity, and then runs the fixed 25-game promotion gate against the current NNUE champion.
-
-If an accepted champion already exists at `training/output/deadfish_current.nnue`, later runs automatically:
-
-- use that champion as the self-play baseline
-- keep the annotation teacher classical
-- warm-start training from `training/checkpoints/deadfish_current.pt`
-- promote the new candidate into those champion slots only if it beats the current baseline in the 25-game gate
-
-You can pass `none` as the sixth argument to skip benchmarking for a pure training batch:
-
-```powershell
-.\train_selfplay_hybrid.bat 500 20 8 8 1+0.01 none
-```
-
-## Validation
+## Validation Coverage
 
 The native test suite covers:
 
@@ -353,23 +225,14 @@ The native test suite covers:
 - castling, en passant, promotion, mate, stalemate, repetition, fifty-move, and insufficient-material cases
 - perft on the starting position, Kiwipete, tactical reference positions, promotion/check cases, and pin/evasion cases
 - SEE regression checks for winning, equal, and losing exchanges
-- search smoke tests for mate finding, movetime limits, and clock-based limits
-- deterministic NNUE loader, fallback, and fixed-score regression checks
+- search smoke tests for mate finding, movetime limits, clock-based limits, node limits, and threaded stop behavior
 - bundled-book usage and clean fallback when book or Syzygy paths are missing
 
-## Current Roadmap Status
+## Roadmap
 
-The current tree includes:
+Current focus:
 
-- the competitive classical core pass: fixed-capacity search move lists, faster bitboard ray attacks, pseudo-legal search movegen, richer TT/eval caches, stronger selectivity, and expanded handcrafted eval
-- native generic-vs-tuned profiling and repeatable regression tooling
-- cutechess-based gauntlet scaffolding and a small example engine ladder
-- the first NNUE data/training/export pipeline under `training/`
-- engine-side `DFNNUE1` loading, accumulator-backed search eval, and `UseNNUE` / `EvalFile` runtime control
-
-Still planned for the engine itself:
-
-- deeper pin/check-evasion-only legal move generation for another search hot-path pass
-- more serious external gauntlets against fixed-version rating-list engines
-- heavier real-world NNUE training runs and tuning
+- stronger classical search selectivity and move ordering
+- faster legal/evasion generation in search hot paths
 - stronger Lazy SMP scaling and thread-aware tuning
+- larger external gauntlets against fixed-version rating-list engines

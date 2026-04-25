@@ -167,7 +167,9 @@ void write_le_f32(std::ofstream& out, float value) {
 }
 
 std::filesystem::path fixture_path(const std::string& name) {
-    return std::filesystem::temp_directory_path() / name;
+    static const std::string run_id = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    return std::filesystem::temp_directory_path() / ("deadfish-" + run_id + "-" + name);
 }
 
 std::filesystem::path write_valid_nnue_fixture() {

@@ -42,10 +42,11 @@ def parse_bestmove(lines: list[str]) -> str:
     raise RuntimeError(f"Missing bestmove in output: {lines}")
 
 
-def configure_engine(engine: UciEngine, hash_mb: int) -> None:
+def configure_engine(engine: UciEngine, hash_mb: int, threads: int) -> None:
     engine.send("uci")
     engine.read_until(lambda line, _: line == "uciok")
     engine.send(f"setoption name Hash value {hash_mb}")
+    engine.send(f"setoption name Threads value {threads}")
     engine.send("setoption name OwnBook value false")
     engine.send("ucinewgame")
     engine.send("isready")
@@ -93,6 +94,8 @@ def main() -> int:
     parser.add_argument("--movetime", type=int, default=75, help="Per-move movetime in milliseconds.")
     parser.add_argument("--max-plies", type=int, default=120, help="Maximum plies before adjudicating a draw.")
     parser.add_argument("--hash", type=int, default=64, help="Hash size for both engines in MB.")
+    parser.add_argument("--threads-a", type=int, default=1, help="Threads option for engine A.")
+    parser.add_argument("--threads-b", type=int, default=1, help="Threads option for engine B.")
     args = parser.parse_args()
 
     engine_a_path = args.engine_a.resolve()
@@ -107,8 +110,8 @@ def main() -> int:
     score_a = Score()
     score_b = Score()
     try:
-        configure_engine(engine_a, args.hash)
-        configure_engine(engine_b, args.hash)
+        configure_engine(engine_a, args.hash, args.threads_a)
+        configure_engine(engine_b, args.hash, args.threads_b)
 
         pairings = [
             ("A", "B", engine_a, engine_b),

@@ -15,6 +15,7 @@
 #include <initializer_list>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -1832,9 +1833,20 @@ struct SharedRootResult {
     int worker_index = std::numeric_limits<int>::max();
 };
 
+struct ThreadPlan {
+    int requested_threads = 1;
+    int active_threads = 1;
+    int full_depth_threads = 1;
+    int root_move_count = 0;
+    int rotation_stride = 1;
+    bool high_thread_mode = false;
+    std::string diagnostic{};
+};
+
 struct SearchSharedState {
     Position root = Position::start_position();
     SearchLimits limits{};
+    ThreadPlan thread_plan{};
     std::chrono::steady_clock::time_point start_time{};
     int soft_time_ms = 0;
     int hard_time_ms = 0;
@@ -1867,6 +1879,9 @@ struct SearchContext {
     int hard_time_ms = 0;
     int worker_index = 0;
     int root_move_rotation = 0;
+    int depth_lag = 0;
+    int aspiration_margin_bonus = 0;
+    bool root_tt_first = true;
     std::array<std::array<Move, 2>, kMaxPly> killers{};
     std::array<std::array<std::array<int, 64>, 64>, 2> history{};
     std::array<std::array<std::array<int, 64>, 64>, 2> capture_history{};
@@ -2294,6 +2309,142 @@ void compute_time_budgets(const Position& root, const SearchLimits& limits, cons
     hard_time_ms = std::clamp(std::max(soft_time_ms + 25, soft_time_ms + soft_time_ms / 3), soft_time_ms, available);
 }
 
+int time_limited_thread_cap(int hard_time_ms) {
+    if (hard_time_ms <= 0) {
+        return 64;
+    }
+    if (hard_time_ms <= 120) {
+        return 2;
+    }
+    if (hard_time_ms <= 350) {
+        return 4;
+    }
+    if (hard_time_ms <= 1000) {
+        return 4;
+    }
+    if (hard_time_ms <= 3000) {
+        return 8;
+    }
+    return 64;
+}
+
+int node_limited_thread_cap(std::uint64_t max_nodes) {
+    if (max_nodes == 0) {
+        return 64;
+    }
+    if (max_nodes < 4'000) {
+        return 2;
+    }
+    if (max_nodes < 20'000) {
+        return 4;
+    }
+    if (max_nodes < 100'000) {
+        return 8;
+    }
+    return 64;
+}
+
+int depth_limited_thread_cap(int max_depth) {
+    if (max_depth <= 0) {
+        return 64;
+    }
+    if (max_depth <= 2) {
+        return 2;
+    }
+    if (max_depth <= 4) {
+        return 6;
+    }
+    return 64;
+}
+
+ThreadPlan make_thread_plan(const Position& root, const SearchLimits& limits, const EngineOptions& options,
+                            int available_threads, int soft_time_ms, int hard_time_ms) {
+    ThreadPlan plan;
+    plan.requested_threads = std::clamp(options.threads, 1, 64);
+    plan.root_move_count = static_cast<int>(root.legal_moves().size());
+
+    const int usable_threads = std::clamp(std::min(plan.requested_threads, available_threads), 1, 64);
+    if (usable_threads <= 1 || plan.root_move_count <= 1 || limits.infinite) {
+        plan.active_threads = std::max(1, std::min(usable_threads, plan.root_move_count <= 1 ? 1 : usable_threads));
+    } else {
+        int cap = usable_threads;
+        cap = std::min(cap, time_limited_thread_cap(hard_time_ms));
+        cap = std::min(cap, node_limited_thread_cap(limits.max_nodes));
+        cap = std::min(cap, depth_limited_thread_cap(limits.max_depth));
+        if (plan.root_move_count <= 3) {
+            cap = std::min(cap, plan.root_move_count + 3);
+        } else if (plan.root_move_count <= 8) {
+            cap = std::min(cap, plan.root_move_count + 5);
+        }
+        plan.active_threads = std::clamp(cap, 1, usable_threads);
+    }
+
+    if (plan.active_threads <= 12) {
+        plan.full_depth_threads = plan.active_threads;
+    } else if (plan.active_threads <= 20) {
+        plan.full_depth_threads = 16;
+    } else {
+        plan.full_depth_threads = 18;
+    }
+    plan.full_depth_threads = std::clamp(plan.full_depth_threads, 1, plan.active_threads);
+    plan.high_thread_mode = plan.active_threads > plan.full_depth_threads;
+
+    const int rotation_mod = std::max(1, plan.root_move_count);
+    plan.rotation_stride = 1;
+    if (rotation_mod > 2 && plan.active_threads > 2) {
+        plan.rotation_stride = std::max(1, rotation_mod / std::max(1, std::min(plan.active_threads, rotation_mod)));
+        while (std::gcd(plan.rotation_stride, rotation_mod) != 1) {
+            ++plan.rotation_stride;
+        }
+    }
+
+    std::ostringstream message;
+    message << "thread plan requested " << plan.requested_threads
+            << " active " << plan.active_threads
+            << " full-depth " << plan.full_depth_threads
+            << " rootmoves " << plan.root_move_count;
+    if (plan.high_thread_mode) {
+        message << " lagged-helpers " << (plan.active_threads - plan.full_depth_threads);
+    }
+    if (soft_time_ms > 0 || hard_time_ms > 0) {
+        message << " soft " << soft_time_ms << " hard " << hard_time_ms;
+    }
+    plan.diagnostic = message.str();
+    return plan;
+}
+
+int root_rotation_for_worker(const ThreadPlan& plan, int worker_index) {
+    if (worker_index <= 0 || plan.root_move_count <= 1) {
+        return 0;
+    }
+    return (worker_index * plan.rotation_stride) % plan.root_move_count;
+}
+
+int depth_lag_for_worker(const ThreadPlan& plan, int worker_index) {
+    if (worker_index < plan.full_depth_threads) {
+        return 0;
+    }
+    const int lagged_index = worker_index - plan.full_depth_threads;
+    return 1 + (lagged_index % 3);
+}
+
+int aspiration_bonus_for_worker(const ThreadPlan& plan, int worker_index) {
+    if (worker_index <= 0) {
+        return 0;
+    }
+    return (worker_index % 4) * (plan.high_thread_mode ? 8 : 4);
+}
+
+bool root_tt_first_for_worker(const ThreadPlan& plan, int worker_index) {
+    if (worker_index <= 0) {
+        return true;
+    }
+    if (worker_index >= plan.full_depth_threads) {
+        return false;
+    }
+    return true;
+}
+
 bool is_zugzwang_prone(const Position& position) {
     return !position.has_non_pawn_material(position.side_to_move()) || position.piece_count() <= 6;
 }
@@ -2365,7 +2516,7 @@ void publish_shared_root_result(SearchContext& context, const SearchNodeResult& 
 }
 
 std::vector<OrderedMove> build_root_move_order(const Position& position, const MoveList& moves, const Move& tt_move,
-                                               const SearchContext& context, int root_rotation) {
+                                               const SearchContext& context, int root_rotation, bool tt_first) {
     std::vector<OrderedMove> ordered{};
     std::optional<OrderedMove> tt_ordered{};
     ordered.reserve(moves.size());
@@ -2377,6 +2528,9 @@ std::vector<OrderedMove> build_root_move_order(const Position& position, const M
             ordered.push_back(scored);
         }
     }
+    if (tt_ordered && !tt_first) {
+        ordered.push_back(*tt_ordered);
+    }
     std::stable_sort(ordered.begin(), ordered.end(), [](const OrderedMove& lhs, const OrderedMove& rhs) {
         return lhs.score > rhs.score;
     });
@@ -2384,7 +2538,7 @@ std::vector<OrderedMove> build_root_move_order(const Position& position, const M
         const std::size_t offset = static_cast<std::size_t>(root_rotation) % ordered.size();
         std::rotate(ordered.begin(), ordered.begin() + offset, ordered.end());
     }
-    if (tt_ordered) {
+    if (tt_ordered && tt_first) {
         ordered.insert(ordered.begin(), *tt_ordered);
     }
     return ordered;
@@ -2458,15 +2612,17 @@ SearchNodeResult quiescence(Position& position, SearchContext& context, int alph
     }
 #endif
 
-    int stand_pat = evaluate_position(position, context, ply);
-    if (stand_pat >= beta) {
-        return node_result(beta, true);
-    }
-    if (stand_pat > alpha) {
-        alpha = stand_pat;
+    const bool in_check = position.in_check(position.side_to_move());
+    if (!in_check) {
+        int stand_pat = evaluate_position(position, context, ply);
+        if (stand_pat >= beta) {
+            return node_result(beta, true);
+        }
+        if (stand_pat > alpha) {
+            alpha = stand_pat;
+        }
     }
 
-    const bool in_check = position.in_check(position.side_to_move());
     MoveList moves;
     generate_pseudo_moves_fast(position, moves, !in_check);
     if (!in_check) {
@@ -2548,6 +2704,12 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
     // so they must be resolved before probing the transposition table.
     if (position.is_draw_by_repetition() || position.is_draw_by_fifty_move() || position.is_insufficient_material()) {
         return node_result(0, true);
+    }
+
+    alpha = std::max(alpha, -kMateScore + ply);
+    beta = std::min(beta, kMateScore - ply - 1);
+    if (alpha >= beta) {
+        return node_result(alpha, true);
     }
 
     const int alpha_original = alpha;
@@ -2706,7 +2868,8 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
     MovePicker picker(position, moves, tt_move, context, ply);
     OrderedMove ordered;
     if (ply == 0) {
-        root_moves = build_root_move_order(position, moves, tt_move, context, context.root_move_rotation);
+        root_moves = build_root_move_order(position, moves, tt_move, context, context.root_move_rotation,
+                                           context.root_tt_first);
     }
     auto next_root_move = [&](OrderedMove& candidate, std::size_t& root_index) -> bool {
         if (ply != 0) {
@@ -2752,7 +2915,6 @@ SearchNodeResult negamax(Position& position, SearchContext& context, int depth, 
                 extension = 1;
             }
         }
-
         UndoState undo;
         if (!position.make_move(move, undo)) {
             ++move_index;
@@ -2905,10 +3067,16 @@ SearchResult run_search_worker(const Position& root, SearchContext& context) {
     const int max_depth = std::max(1, context.limits.max_depth > 0 ? context.limits.max_depth : default_depth);
     int previous_score = 0;
     int root_stability = 0;
-    for (int depth = 1; depth <= max_depth; ++depth) {
+    int last_search_depth = 0;
+    for (int iteration_depth = 1; iteration_depth <= max_depth; ++iteration_depth) {
+        const int depth = std::max(1, iteration_depth - context.depth_lag);
+        if (depth == last_search_depth) {
+            continue;
+        }
+        last_search_depth = depth;
         SearchNodeResult node;
         if (depth >= 4 && result.completed) {
-            int window = kDefaultAspirationWindow;
+            int window = kDefaultAspirationWindow + context.aspiration_margin_bonus;
             while (true) {
                 const int aspiration_alpha = std::max(-kInfinity, previous_score - window);
                 const int aspiration_beta = std::min(kInfinity, previous_score + window);
@@ -2963,6 +3131,7 @@ SearchResult run_search_worker(const Position& root, SearchContext& context) {
                 .nps = nps,
                 .elapsed_ms = elapsed,
                 .pv = result.pv,
+                .message = "",
             });
         }
         if (std::abs(result.score) >= kMateScore - 128) {
@@ -3007,7 +3176,10 @@ SearchContext make_worker_context(EngineState& state, SearchSharedState* shared,
     context.hard_time_ms = shared->hard_time_ms;
     context.nnue = shared->nnue;
     context.worker_index = worker_index;
-    context.root_move_rotation = std::max(0, worker_index);
+    context.root_move_rotation = root_rotation_for_worker(shared->thread_plan, worker_index);
+    context.depth_lag = depth_lag_for_worker(shared->thread_plan, worker_index);
+    context.aspiration_margin_bonus = aspiration_bonus_for_worker(shared->thread_plan, worker_index);
+    context.root_tt_first = root_tt_first_for_worker(shared->thread_plan, worker_index);
     return context;
 }
 
@@ -3027,6 +3199,9 @@ void worker_loop(EngineState* state, int worker_index) {
             search = state->active_search;
         }
         if (!search) {
+            continue;
+        }
+        if (worker_index >= search->thread_plan.active_threads) {
             continue;
         }
 
@@ -3190,7 +3365,25 @@ SearchResult Engine::search(const Position& root, const SearchLimits& limits, Se
 
     state_->tt.new_search();
 
-    if (state_->options.threads <= 1 || state_->worker_threads.empty()) {
+    int soft_time_ms = 0;
+    int hard_time_ms = 0;
+    compute_time_budgets(root, limits, state_->options, soft_time_ms, hard_time_ms);
+    const int available_threads = static_cast<int>(state_->worker_threads.size()) + 1;
+    const ThreadPlan thread_plan =
+        make_thread_plan(root, limits, state_->options, available_threads, soft_time_ms, hard_time_ms);
+    if (callback && thread_plan.requested_threads > 1) {
+        callback(SearchInfo{
+            .depth = 0,
+            .score = 0,
+            .nodes = 0,
+            .nps = 0,
+            .elapsed_ms = 0,
+            .pv = {},
+            .message = thread_plan.diagnostic,
+        });
+    }
+
+    if (thread_plan.active_threads <= 1 || state_->worker_threads.empty()) {
         SearchContext context;
         context.state = state_.get();
         context.limits = limits;
@@ -3198,17 +3391,20 @@ SearchResult Engine::search(const Position& root, const SearchLimits& limits, Se
         context.start_time = std::chrono::steady_clock::now();
         context.nnue = active_nnue(*state_);
         context.worker_index = 0;
-        compute_time_budgets(root, limits, state_->options, context.soft_time_ms, context.hard_time_ms);
+        context.soft_time_ms = soft_time_ms;
+        context.hard_time_ms = hard_time_ms;
         return run_search_worker(root, context);
     }
 
     auto shared = std::make_shared<SearchSharedState>();
     shared->root = root;
     shared->limits = limits;
+    shared->thread_plan = thread_plan;
     shared->start_time = std::chrono::steady_clock::now();
     shared->nnue = active_nnue(*state_);
-    shared->helpers_remaining.store(static_cast<int>(state_->worker_threads.size()), std::memory_order_relaxed);
-    compute_time_budgets(root, limits, state_->options, shared->soft_time_ms, shared->hard_time_ms);
+    shared->helpers_remaining.store(thread_plan.active_threads - 1, std::memory_order_relaxed);
+    shared->soft_time_ms = soft_time_ms;
+    shared->hard_time_ms = hard_time_ms;
 
     {
         std::lock_guard<std::mutex> lock(state_->worker_mutex);
@@ -4737,6 +4933,7 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
     evaluate_rooks(Color::White, white, black);
     evaluate_rooks(Color::Black, black, white);
 
+    const int phase = std::min(24, raw_phase);
     auto evaluate_activity = [&](Color color, SideEval& side, const SideEval& enemy) {
         const Bitboard enemy_occupancy = position.occupancy(opposite(color));
         const Bitboard own_occupancy = position.occupancy(color);
@@ -4821,7 +5018,6 @@ ClassicalEvalBreakdown evaluate_classical_breakdown(const Position& position) {
     evaluate_activity(Color::White, white, black);
     evaluate_activity(Color::Black, black, white);
 
-    const int phase = std::min(24, raw_phase);
     auto evaluate_king = [&](Color color, SideEval& side, const SideEval& enemy) {
         if (side.king_square == kNoSquare) {
             return;

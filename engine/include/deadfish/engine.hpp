@@ -89,6 +89,7 @@ struct SearchInfo {
     std::uint64_t nps = 0;
     int elapsed_ms = 0;
     std::vector<Move> pv;
+    std::string message;
 };
 
 struct EngineOptions {

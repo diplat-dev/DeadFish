@@ -351,6 +351,10 @@ int command_search(const CommandOptions& options) {
     const SearchLimits limits = make_limits(options);
     SearchResult result = engine.search(position, limits, [&](const SearchInfo& info) {
         if (!options.json) {
+            if (!info.message.empty()) {
+                std::cout << "info string " << info.message << "\n";
+                return;
+            }
             std::cout << "info depth " << info.depth
                       << " score " << deadfish::score_to_string(info.score)
                       << " nodes " << info.nodes
@@ -624,6 +628,10 @@ private:
     }
 
     void output_info(const SearchInfo& info) {
+        if (!info.message.empty()) {
+            output_line("info string " + info.message);
+            return;
+        }
         std::ostringstream out;
         out << "info depth " << info.depth
             << " score " << uci_score(info.score)
